@@ -1,1 +1,0 @@
-proprietary_kernel_alps
