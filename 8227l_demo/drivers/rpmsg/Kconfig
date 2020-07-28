@@ -6,4 +6,12 @@ config RPMSG
 	select VIRTIO
 	select VIRTUALIZATION
 
+config RPMSG_MTK_SCP
+	tristate "MediaTek SCP"
+	depends on MTK_SCP
+	select RPMSG
+	help
+	  Say y here to enable support providing communication channels to
+	  remote processors in MediaTek platforms.
+	  This use IPI and IPC to communicate with remote processors.
 endmenu

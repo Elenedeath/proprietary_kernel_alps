@@ -47,6 +47,14 @@ obj-$(CONFIG_SOC_CAMERA)		+= soc_camera/
 
 obj-$(CONFIG_VIDEO_RENESAS_VSP1)	+= vsp1/
 
+obj-$(CONFIG_VIDEO_MEDIATEK_VPU)	+= mtk-vpu/
+
+obj-$(CONFIG_VIDEO_MEDIATEK_VCODEC)	+= mtk-vcodec/
+
+obj-$(CONFIG_VIDEO_MEDIATEK_MDP)	+= mtk-mdp/
+
+obj-$(CONFIG_VIDEO_MEDIATEK_JPEG)	+= mtk-jpeg/
+
 obj-y	+= omap/
 
 ccflags-y += -I$(srctree)/drivers/media/i2c
