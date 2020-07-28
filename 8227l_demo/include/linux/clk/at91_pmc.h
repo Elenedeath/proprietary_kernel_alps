@@ -1,5 +1,5 @@
 /*
- * arch/arm/mach-at91/include/mach/at91_pmc.h
+ * include/linux/clk/at91_pmc.h
  *
  * Copyright (C) 2005 Ivan Kokshaysky
  * Copyright (C) SAN People
@@ -125,12 +125,16 @@ extern void __iomem *at91_pmc_base;
 #define		AT91_PMC_PLLADIV2	(1 << 12)		/* PLLA divisor by 2 [some SAM9 only] */
 #define			AT91_PMC_PLLADIV2_OFF		(0 << 12)
 #define			AT91_PMC_PLLADIV2_ON		(1 << 12)
+#define		AT91_PMC_H32MXDIV	BIT(24)
 
 #define	AT91_PMC_USB		0x38			/* USB Clock Register [some SAM9 only] */
 #define		AT91_PMC_USBS		(0x1 <<  0)		/* USB OHCI Input clock selection */
 #define			AT91_PMC_USBS_PLLA		(0 << 0)
 #define			AT91_PMC_USBS_UPLL		(1 << 0)
+#define			AT91_PMC_USBS_PLLB		(1 << 0)	/* [AT91SAMN12 only] */
 #define		AT91_PMC_OHCIUSBDIV	(0xF <<  8)		/* Divider for USB OHCI Clock */
+#define			AT91_PMC_OHCIUSBDIV_1	(0x0 <<  8)
+#define			AT91_PMC_OHCIUSBDIV_2	(0x1 <<  8)
 
 #define	AT91_PMC_SMD		0x3c			/* Soft Modem Clock Register [some SAM9 only] */
 #define		AT91_PMC_SMDS		(0x1  <<  0)		/* SMD input clock selection */
@@ -152,6 +156,7 @@ extern void __iomem *at91_pmc_base;
 #define		AT91_PMC_LOCKB		(1 <<  2)		/* PLLB Lock */
 #define		AT91_PMC_MCKRDY		(1 <<  3)		/* Master Clock */
 #define		AT91_PMC_LOCKU		(1 <<  6)		/* UPLL Lock [some SAM9] */
+#define		AT91_PMC_OSCSEL		(1 <<  7)		/* Slow Oscillator Selection [some SAM9] */
 #define		AT91_PMC_PCK0RDY	(1 <<  8)		/* Programmable Clock 0 */
 #define		AT91_PMC_PCK1RDY	(1 <<  9)		/* Programmable Clock 1 */
 #define		AT91_PMC_PCK2RDY	(1 << 10)		/* Programmable Clock 2 */
@@ -160,6 +165,8 @@ extern void __iomem *at91_pmc_base;
 #define		AT91_PMC_MOSCRCS	(1 << 17)		/* Main On-Chip RC [some SAM9] */
 #define		AT91_PMC_CFDEV		(1 << 18)		/* Clock Failure Detector Event [some SAM9] */
 #define	AT91_PMC_IMR		0x6c			/* Interrupt Mask Register */
+
+#define AT91_PMC_PLLICPR	0x80			/* PLL Charge Pump Current Register */
 
 #define AT91_PMC_PROT		0xe4			/* Write Protect Mode Register [some SAM9] */
 #define		AT91_PMC_WPEN		(0x1  <<  0)		/* Write Protect Enable */

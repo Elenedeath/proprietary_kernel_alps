@@ -76,7 +76,6 @@ static void usage(const char *error)
 	       "  SOF_TIMESTAMPING_RX_HARDWARE - hardware time stamping of incoming packets\n"
 	       "  SOF_TIMESTAMPING_RX_SOFTWARE - software fallback for incoming packets\n"
 	       "  SOF_TIMESTAMPING_SOFTWARE - request reporting of software time stamps\n"
-	       "  SOF_TIMESTAMPING_SYS_HARDWARE - request reporting of transformed HW time stamps\n"
 	       "  SOF_TIMESTAMPING_RAW_HARDWARE - request reporting of raw HW time stamps\n"
 	       "  SIOCGSTAMP - check last socket time stamp\n"
 	       "  SIOCGSTAMPNS - more accurate socket time stamp\n");
@@ -202,9 +201,7 @@ static void printpacket(struct msghdr *msg, int res,
 				       (long)stamp->tv_sec,
 				       (long)stamp->tv_nsec);
 				stamp++;
-				printf("HW transformed %ld.%09ld ",
-				       (long)stamp->tv_sec,
-				       (long)stamp->tv_nsec);
+				/* skip deprecated HW transformed */
 				stamp++;
 				printf("HW raw %ld.%09ld",
 				       (long)stamp->tv_sec,
@@ -335,10 +332,16 @@ int main(int argc, char **argv)
 	int val;
 	socklen_t len;
 	struct timeval next;
+	size_t if_len;
 
 	if (argc < 2)
 		usage(0);
 	interface = argv[1];
+	if_len = strlen(interface);
+	if (if_len >= IFNAMSIZ) {
+		printf("interface name exceeds IFNAMSIZ\n");
+		exit(1);
+	}
 
 	for (i = 2; i < argc; i++) {
 		if (!strcasecmp(argv[i], "SO_TIMESTAMP"))
@@ -361,8 +364,6 @@ int main(int argc, char **argv)
 			so_timestamping_flags |= SOF_TIMESTAMPING_RX_SOFTWARE;
 		else if (!strcasecmp(argv[i], "SOF_TIMESTAMPING_SOFTWARE"))
 			so_timestamping_flags |= SOF_TIMESTAMPING_SOFTWARE;
-		else if (!strcasecmp(argv[i], "SOF_TIMESTAMPING_SYS_HARDWARE"))
-			so_timestamping_flags |= SOF_TIMESTAMPING_SYS_HARDWARE;
 		else if (!strcasecmp(argv[i], "SOF_TIMESTAMPING_RAW_HARDWARE"))
 			so_timestamping_flags |= SOF_TIMESTAMPING_RAW_HARDWARE;
 		else
@@ -374,12 +375,12 @@ int main(int argc, char **argv)
 		bail("socket");
 
 	memset(&device, 0, sizeof(device));
-	strncpy(device.ifr_name, interface, sizeof(device.ifr_name));
+	memcpy(device.ifr_name, interface, if_len + 1);
 	if (ioctl(sock, SIOCGIFADDR, &device) < 0)
 		bail("getting interface IP address");
 
 	memset(&hwtstamp, 0, sizeof(hwtstamp));
-	strncpy(hwtstamp.ifr_name, interface, sizeof(hwtstamp.ifr_name));
+	memcpy(hwtstamp.ifr_name, interface, if_len + 1);
 	hwtstamp.ifr_data = (void *)&hwconfig;
 	memset(&hwconfig, 0, sizeof(hwconfig));
 	hwconfig.tx_type =

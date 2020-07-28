@@ -2,11 +2,11 @@
 obj- := dummy.o
 
 # List of programs to build
-hostprogs-y := ifenslave
+hostprogs-y := test_verifier
 
-HOSTCFLAGS_ifenslave.o += -I$(objtree)/usr/include
+test_verifier-objs := test_verifier.o libbpf.o
 
 # Tell kbuild to always build the programs
 always := $(hostprogs-y)
 
-obj-m := timestamping/
+HOSTCFLAGS += -I$(objtree)/usr/include
