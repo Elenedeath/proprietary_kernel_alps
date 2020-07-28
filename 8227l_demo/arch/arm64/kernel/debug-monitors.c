@@ -26,24 +26,16 @@
 #include <linux/stat.h>
 #include <linux/uaccess.h>
 
-#include <asm/debug-monitors.h>
-#include <asm/local.h>
+#include <asm/cpufeature.h>
 #include <asm/cputype.h>
+#include <asm/debug-monitors.h>
 #include <asm/system_misc.h>
-
-/* Low-level stepping controls. */
-#define DBG_MDSCR_SS		(1 << 0)
-#define DBG_SPSR_SS		(1 << 21)
-
-/* MDSCR_EL1 enabling bits */
-#define DBG_MDSCR_KDE		(1 << 13)
-#define DBG_MDSCR_MDE		(1 << 15)
-#define DBG_MDSCR_MASK		~(DBG_MDSCR_KDE | DBG_MDSCR_MDE)
 
 /* Determine debug architecture. */
 u8 debug_monitors_arch(void)
 {
-	return read_cpuid(ID_AA64DFR0_EL1) & 0xf;
+	return cpuid_feature_extract_field(read_system_reg(SYS_ID_AA64DFR0_EL1),
+						ID_AA64DFR0_DEBUGVER_SHIFT);
 }
 
 /*
@@ -89,8 +81,8 @@ early_param("nodebugmon", early_debug_disable);
  * Keep track of debug users on each core.
  * The ref counts are per-cpu so we use a local_t type.
  */
-static DEFINE_PER_CPU(local_t, mde_ref_count);
-static DEFINE_PER_CPU(local_t, kde_ref_count);
+static DEFINE_PER_CPU(int, mde_ref_count);
+static DEFINE_PER_CPU(int, kde_ref_count);
 
 void enable_debug_monitors(enum debug_el el)
 {
@@ -98,11 +90,11 @@ void enable_debug_monitors(enum debug_el el)
 
 	WARN_ON(preemptible());
 
-	if (local_inc_return(&__get_cpu_var(mde_ref_count)) == 1)
+	if (this_cpu_inc_return(mde_ref_count) == 1)
 		enable = DBG_MDSCR_MDE;
 
 	if (el == DBG_ACTIVE_EL1 &&
-	    local_inc_return(&__get_cpu_var(kde_ref_count)) == 1)
+	    this_cpu_inc_return(kde_ref_count) == 1)
 		enable |= DBG_MDSCR_KDE;
 
 	if (enable && debug_enabled) {
@@ -118,11 +110,11 @@ void disable_debug_monitors(enum debug_el el)
 
 	WARN_ON(preemptible());
 
-	if (local_dec_and_test(&__get_cpu_var(mde_ref_count)))
+	if (this_cpu_dec_return(mde_ref_count) == 0)
 		disable = ~DBG_MDSCR_MDE;
 
 	if (el == DBG_ACTIVE_EL1 &&
-	    local_dec_and_test(&__get_cpu_var(kde_ref_count)))
+	    this_cpu_dec_return(kde_ref_count) == 0)
 		disable &= ~DBG_MDSCR_KDE;
 
 	if (disable) {
@@ -140,28 +132,31 @@ static void clear_os_lock(void *unused)
 	asm volatile("msr oslar_el1, %0" : : "r" (0));
 }
 
-static int __cpuinit os_lock_notify(struct notifier_block *self,
+static int os_lock_notify(struct notifier_block *self,
 				    unsigned long action, void *data)
 {
 	int cpu = (unsigned long)data;
-	if (action == CPU_ONLINE)
+	if ((action & ~CPU_TASKS_FROZEN) == CPU_ONLINE)
 		smp_call_function_single(cpu, clear_os_lock, NULL, 1);
 	return NOTIFY_OK;
 }
 
-static struct notifier_block __cpuinitdata os_lock_nb = {
+static struct notifier_block os_lock_nb = {
 	.notifier_call = os_lock_notify,
 };
 
-static int __cpuinit debug_monitors_init(void)
+static int debug_monitors_init(void)
 {
+	cpu_notifier_register_begin();
+
 	/* Clear the OS lock. */
 	on_each_cpu(clear_os_lock, NULL, 1);
 	isb();
-	local_dbg_enable();
 
 	/* Register hotplug handler. */
-	register_cpu_notifier(&os_lock_nb);
+	__register_cpu_notifier(&os_lock_nb);
+
+	cpu_notifier_register_done();
 	return 0;
 }
 postcore_initcall(debug_monitors_init);
@@ -190,20 +185,21 @@ static void clear_regs_spsr_ss(struct pt_regs *regs)
 
 /* EL1 Single Step Handler hooks */
 static LIST_HEAD(step_hook);
-DEFINE_RWLOCK(step_hook_lock);
+static DEFINE_SPINLOCK(step_hook_lock);
 
 void register_step_hook(struct step_hook *hook)
 {
-	write_lock(&step_hook_lock);
-	list_add(&hook->node, &step_hook);
-	write_unlock(&step_hook_lock);
+	spin_lock(&step_hook_lock);
+	list_add_rcu(&hook->node, &step_hook);
+	spin_unlock(&step_hook_lock);
 }
 
 void unregister_step_hook(struct step_hook *hook)
 {
-	write_lock(&step_hook_lock);
-	list_del(&hook->node);
-	write_unlock(&step_hook_lock);
+	spin_lock(&step_hook_lock);
+	list_del_rcu(&hook->node);
+	spin_unlock(&step_hook_lock);
+	synchronize_rcu();
 }
 
 /*
@@ -217,15 +213,15 @@ static int call_step_hook(struct pt_regs *regs, unsigned int esr)
 	struct step_hook *hook;
 	int retval = DBG_HOOK_ERROR;
 
-	read_lock(&step_hook_lock);
+	rcu_read_lock();
 
-	list_for_each_entry(hook, &step_hook, node)	{
+	list_for_each_entry_rcu(hook, &step_hook, node)	{
 		retval = hook->fn(regs, esr);
 		if (retval == DBG_HOOK_HANDLED)
 			break;
 	}
 
-	read_unlock(&step_hook_lock);
+	rcu_read_unlock();
 
 	return retval;
 }
@@ -277,7 +273,7 @@ static int single_step_handler(unsigned long addr, unsigned int esr,
  * Use reader/writer locks instead of plain spinlock.
  */
 static LIST_HEAD(break_hook);
-DEFINE_RWLOCK(break_hook_lock);
+static DEFINE_RWLOCK(break_hook_lock);
 
 void register_break_hook(struct break_hook *hook)
 {
@@ -332,7 +328,8 @@ static int brk_handler(unsigned long addr, unsigned int esr,
 int aarch32_break_handler(struct pt_regs *regs)
 {
 	siginfo_t info;
-	unsigned int instr;
+	u32 arm_instr;
+	u16 thumb_instr;
 	bool bp = false;
 	void __user *pc = (void __user *)instruction_pointer(regs);
 
@@ -341,18 +338,21 @@ int aarch32_break_handler(struct pt_regs *regs)
 
 	if (compat_thumb_mode(regs)) {
 		/* get 16-bit Thumb instruction */
-		get_user(instr, (u16 __user *)pc);
-		if (instr == AARCH32_BREAK_THUMB2_LO) {
+		get_user(thumb_instr, (u16 __user *)pc);
+		thumb_instr = le16_to_cpu(thumb_instr);
+		if (thumb_instr == AARCH32_BREAK_THUMB2_LO) {
 			/* get second half of 32-bit Thumb-2 instruction */
-			get_user(instr, (u16 __user *)(pc + 2));
-			bp = instr == AARCH32_BREAK_THUMB2_HI;
+			get_user(thumb_instr, (u16 __user *)(pc + 2));
+			thumb_instr = le16_to_cpu(thumb_instr);
+			bp = thumb_instr == AARCH32_BREAK_THUMB2_HI;
 		} else {
-			bp = instr == AARCH32_BREAK_THUMB;
+			bp = thumb_instr == AARCH32_BREAK_THUMB;
 		}
 	} else {
 		/* 32-bit ARM instruction */
-		get_user(instr, (u32 __user *)pc);
-		bp = (instr & ~0xf0000000) == AARCH32_BREAK_ARM;
+		get_user(arm_instr, (u32 __user *)pc);
+		arm_instr = le32_to_cpu(arm_instr);
+		bp = (arm_instr & ~0xf0000000) == AARCH32_BREAK_ARM;
 	}
 
 	if (!bp)

@@ -29,60 +29,16 @@
 #include <linux/seq_file.h>
 #include <linux/ratelimit.h>
 
-#include <linux/mt_sched_mon.h>
 unsigned long irq_err_count;
 
 int arch_show_interrupts(struct seq_file *p, int prec)
 {
-#ifdef CONFIG_SMP
 	show_ipi_list(p, prec);
-#endif
 	seq_printf(p, "%*s: %10lu\n", prec, "Err", irq_err_count);
 	return 0;
 }
 
-#ifdef CONFIG_MTK_SCHED_TRACERS
-#include <trace/events/mtk_events.h>
-#endif
-
-/*
- * handle_IRQ handles all hardware IRQ's.  Decoded IRQs should
- * not come via this function.  Instead, they should provide their
- * own 'handler'.  Used by platform code implementing C-based 1st
- * level decoding.
- */
-void handle_IRQ(unsigned int irq, struct pt_regs *regs)
-{
-	struct pt_regs *old_regs = set_irq_regs(regs);
-#ifdef CONFIG_MTK_SCHED_TRACERS
-    struct irq_desc *desc;
-#endif
-
-	irq_enter();
-    mt_trace_ISR_start(irq);
-#ifdef CONFIG_MTK_SCHED_TRACERS
-    desc = irq_to_desc(irq);
-    trace_irq_entry(irq,
-            (desc && desc->action && desc->action->name) ? desc->action->name : "-");
-#endif
-
-	/*
-	 * Some hardware gives randomly wrong interrupts.  Rather
-	 * than crashing, do something sensible.
-	 */
-	if (unlikely(irq >= nr_irqs)) {
-		pr_warn_ratelimited("Bad IRQ%u\n", irq);
-		ack_bad_irq(irq);
-	} else {
-		generic_handle_irq(irq);
-	}
-#ifdef CONFIG_MTK_SCHED_TRACERS
-    trace_irq_exit(irq);
-#endif
-    mt_trace_ISR_end(irq);
-	irq_exit();
-	set_irq_regs(old_regs);
-}
+void (*handle_arch_irq)(struct pt_regs *) = NULL;
 
 void __init set_handle_irq(void (*handle_irq)(struct pt_regs *))
 {
@@ -122,7 +78,7 @@ static bool migrate_one_irq(struct irq_desc *desc)
 	c = irq_data_get_irq_chip(d);
 	if (!c->irq_set_affinity)
 		pr_debug("IRQ%u: unable to set affinity\n", d->irq);
-	else if (c->irq_set_affinity(d, affinity, true) == IRQ_SET_MASK_OK && ret)
+	else if (c->irq_set_affinity(d, affinity, false) == IRQ_SET_MASK_OK && ret)
 		cpumask_copy(d->affinity, affinity);
 
 	return ret;

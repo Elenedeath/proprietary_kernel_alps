@@ -69,8 +69,6 @@ extern unsigned long end_iomem;
 #define PAGE_KERNEL	__pgprot(_PAGE_PRESENT | _PAGE_RW | _PAGE_DIRTY | _PAGE_ACCESSED)
 #define PAGE_KERNEL_EXEC	__pgprot(__PAGE_KERNEL_EXEC)
 
-#define io_remap_pfn_range	remap_pfn_range
-
 /*
  * The i386 can't do page protection for execute, and considers that the same
  * are read.
@@ -212,12 +210,17 @@ static inline pte_t pte_mkold(pte_t pte)
 
 static inline pte_t pte_wrprotect(pte_t pte)
 { 
-	pte_clear_bits(pte, _PAGE_RW);
+	if (likely(pte_get_bits(pte, _PAGE_RW)))
+		pte_clear_bits(pte, _PAGE_RW);
+	else
+		return pte;
 	return(pte_mknewprot(pte)); 
 }
 
 static inline pte_t pte_mkread(pte_t pte)
 { 
+	if (unlikely(pte_get_bits(pte, _PAGE_USER)))
+		return pte;
 	pte_set_bits(pte, _PAGE_USER);
 	return(pte_mknewprot(pte)); 
 }
@@ -236,6 +239,8 @@ static inline pte_t pte_mkyoung(pte_t pte)
 
 static inline pte_t pte_mkwrite(pte_t pte)	
 {
+	if (unlikely(pte_get_bits(pte,  _PAGE_RW)))
+		return pte;
 	pte_set_bits(pte, _PAGE_RW);
 	return(pte_mknewprot(pte)); 
 }

@@ -631,8 +631,8 @@ int ubifs_create_dflt_lpt(struct ubifs_info *c, int *main_lebs, int lpt_first,
 	lsave = kmalloc(sizeof(int) * c->lsave_cnt, GFP_KERNEL);
 	pnode = kzalloc(sizeof(struct ubifs_pnode), GFP_KERNEL);
 	nnode = kzalloc(sizeof(struct ubifs_nnode), GFP_KERNEL);
-	buf = kmalloc(c->leb_size, GFP_KERNEL);
-	ltab = kmalloc(sizeof(struct ubifs_lpt_lprops) * c->lpt_lebs, GFP_KERNEL);
+	buf = vmalloc(c->leb_size);
+	ltab = vmalloc(sizeof(struct ubifs_lpt_lprops) * c->lpt_lebs);
 	if (!pnode || !nnode || !buf || !ltab || !lsave) {
 		err = -ENOMEM;
 		goto out;
@@ -851,8 +851,8 @@ int ubifs_create_dflt_lpt(struct ubifs_info *c, int *main_lebs, int lpt_first,
 out:
 	c->ltab = NULL;
 	kfree(lsave);
-	kfree(ltab);
-	kfree(buf);
+	vfree(ltab);
+	vfree(buf);
 	kfree(nnode);
 	kfree(pnode);
 	return err;
@@ -1327,7 +1327,7 @@ static int read_ltab(struct ubifs_info *c)
 	int err;
 	void *buf;
 
-	buf = kmalloc(c->ltab_sz, GFP_KERNEL);
+	buf = vmalloc(c->ltab_sz);
 	if (!buf)
 		return -ENOMEM;
 	err = ubifs_leb_read(c, c->ltab_lnum, buf, c->ltab_offs, c->ltab_sz, 1);
@@ -1335,7 +1335,7 @@ static int read_ltab(struct ubifs_info *c)
 		goto out;
 	err = unpack_ltab(c, buf);
 out:
-	kfree(buf);
+	vfree(buf);
 	return err;
 }
 
@@ -1350,7 +1350,7 @@ static int read_lsave(struct ubifs_info *c)
 	int err, i;
 	void *buf;
 
-	buf = kmalloc(c->lsave_sz, GFP_KERNEL);
+	buf = vmalloc(c->lsave_sz);
 	if (!buf)
 		return -ENOMEM;
 	err = ubifs_leb_read(c, c->lsave_lnum, buf, c->lsave_offs,
@@ -1377,7 +1377,7 @@ static int read_lsave(struct ubifs_info *c)
 		}
 	}
 out:
-	kfree(buf);
+	vfree(buf);
 	return err;
 }
 
@@ -1464,7 +1464,6 @@ struct ubifs_lprops *ubifs_lpt_lookup(struct ubifs_info *c, int lnum)
 			return ERR_CAST(nnode);
 	}
 	iip = ((i >> shft) & (UBIFS_LPT_FANOUT - 1));
-	shft -= UBIFS_LPT_FANOUT_SHIFT;
 	pnode = ubifs_get_pnode(c, nnode, iip);
 	if (IS_ERR(pnode))
 		return ERR_CAST(pnode);
@@ -1604,7 +1603,6 @@ struct ubifs_lprops *ubifs_lpt_lookup_dirty(struct ubifs_info *c, int lnum)
 			return ERR_CAST(nnode);
 	}
 	iip = ((i >> shft) & (UBIFS_LPT_FANOUT - 1));
-	shft -= UBIFS_LPT_FANOUT_SHIFT;
 	pnode = ubifs_get_pnode(c, nnode, iip);
 	if (IS_ERR(pnode))
 		return ERR_CAST(pnode);
@@ -1629,7 +1627,7 @@ static int lpt_init_rd(struct ubifs_info *c)
 {
 	int err, i;
 
-	c->ltab = kmalloc(sizeof(struct ubifs_lpt_lprops) * c->lpt_lebs, GFP_KERNEL);
+	c->ltab = vmalloc(sizeof(struct ubifs_lpt_lprops) * c->lpt_lebs);
 	if (!c->ltab)
 		return -ENOMEM;
 
@@ -1691,13 +1689,11 @@ static int lpt_init_wr(struct ubifs_info *c)
 {
 	int err, i;
 
-	c->ltab_cmt = kmalloc(sizeof(struct ubifs_lpt_lprops) * c->lpt_lebs, GFP_KERNEL);
+	c->ltab_cmt = vmalloc(sizeof(struct ubifs_lpt_lprops) * c->lpt_lebs);
 	if (!c->ltab_cmt)
 		return -ENOMEM;
 
-	if(c->lpt_buf == NULL) {
-		c->lpt_buf = kmalloc(c->leb_size, GFP_KERNEL);
-	}
+	c->lpt_buf = vmalloc(c->leb_size);
 	if (!c->lpt_buf)
 		return -ENOMEM;
 
@@ -1966,7 +1962,6 @@ again:
 		}
 	}
 	iip = ((i >> shft) & (UBIFS_LPT_FANOUT - 1));
-	shft -= UBIFS_LPT_FANOUT_SHIFT;
 	pnode = scan_get_pnode(c, path + h, nnode, iip);
 	if (IS_ERR(pnode)) {
 		err = PTR_ERR(pnode);
@@ -2200,6 +2195,7 @@ static int dbg_chk_pnode(struct ubifs_info *c, struct ubifs_pnode *pnode,
 					  lprops->dirty);
 				return -EINVAL;
 			}
+			break;
 		case LPROPS_FREEABLE:
 		case LPROPS_FRDI_IDX:
 			if (lprops->free + lprops->dirty != c->leb_size) {
@@ -2208,6 +2204,7 @@ static int dbg_chk_pnode(struct ubifs_info *c, struct ubifs_pnode *pnode,
 					  lprops->dirty);
 				return -EINVAL;
 			}
+			break;
 		}
 	}
 	return 0;

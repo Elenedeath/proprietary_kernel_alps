@@ -30,7 +30,6 @@
 #include <linux/blkpg.h>
 #include <linux/spinlock.h>
 #include <linux/hdreg.h>
-#include <linux/init.h>
 #include <linux/mutex.h>
 #include <asm/uaccess.h>
 
@@ -83,11 +82,13 @@ static int do_blktrans_request(struct mtd_blktrans_ops *tr,
 
 	block = blk_rq_pos(req) << 9 >> tr->blkshift;
 	nsect = blk_rq_cur_bytes(req) >> tr->blkshift;
-
-	buf = req->buffer;
+	buf = bio_data(req->bio);
 
 	if (req->cmd_type != REQ_TYPE_FS)
 		return -EIO;
+
+	if (req->cmd_flags & REQ_FLUSH)
+		return tr->flush(dev);
 
 	if (blk_rq_pos(req) + blk_rq_cur_sectors(req) >
 	    get_capacity(req->rq_disk))
@@ -96,14 +97,13 @@ static int do_blktrans_request(struct mtd_blktrans_ops *tr,
 	if (req->cmd_flags & REQ_DISCARD)
 		return tr->discard(dev, block, nsect);
 
-	switch(rq_data_dir(req)) {
-	case READ:
+	if (rq_data_dir(req) == READ) {
 		for (; nsect > 0; nsect--, block++, buf += tr->blksize)
 			if (tr->readsect(dev, block, buf))
 				return -EIO;
 		rq_flush_dcache_pages(req);
 		return 0;
-	case WRITE:
+	} else {
 		if (!tr->writesect)
 			return -EIO;
 
@@ -112,9 +112,6 @@ static int do_blktrans_request(struct mtd_blktrans_ops *tr,
 			if (tr->writesect(dev, block, buf))
 				return -EIO;
 		return 0;
-	default:
-		printk(KERN_NOTICE "Unknown request %u\n", rq_data_dir(req));
-		return -EIO;
 	}
 }
 
@@ -410,16 +407,18 @@ int add_mtd_blktrans_dev(struct mtd_blktrans_dev *new)
 	/* Create the request queue */
 	spin_lock_init(&new->queue_lock);
 	new->rq = blk_init_queue(mtd_blktrans_request, &new->queue_lock);
-#ifdef CONFIG_MTK_MTD_NAND
-		new->rq->backing_dev_info.ra_pages =0;
-#endif
+
 	if (!new->rq)
 		goto error3;
+
+	if (tr->flush)
+		blk_queue_flush(new->rq, REQ_FLUSH);
 
 	new->rq->queuedata = new;
 	blk_queue_logical_block_size(new->rq, tr->blksize);
 
 	queue_flag_set_unlocked(QUEUE_FLAG_NONROT, new->rq);
+	queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, new->rq);
 
 	if (tr->discard) {
 		queue_flag_set_unlocked(QUEUE_FLAG_DISCARD, new->rq);

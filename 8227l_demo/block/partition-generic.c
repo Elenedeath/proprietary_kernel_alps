@@ -320,8 +320,10 @@ struct hd_struct *add_partition(struct gendisk *disk, int partno,
 
 	if (info) {
 		struct partition_meta_info *pinfo = alloc_part_info(disk);
-		if (!pinfo)
+		if (!pinfo) {
+			err = -ENOMEM;
 			goto out_free_stats;
+		}
 		memcpy(pinfo, info, sizeof(*info));
 		p->info = pinfo;
 	}
@@ -523,7 +525,6 @@ rescan:
 
 		if (state->parts[p].has_info)
 			info = &state->parts[p].info;
-		printk("add_partition==[%s:p%d]==start = %llu,size = %llu\n", disk->disk_name, p, (unsigned long long)from, (unsigned long long)size);
 		part = add_partition(disk, p, from, size,
 				     state->parts[p].flags,
 				     &state->parts[p].info);

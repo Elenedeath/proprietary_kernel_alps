@@ -22,7 +22,6 @@
 #ifndef __UBI_UBI_H__
 #define __UBI_UBI_H__
 
-#include <linux/init.h>
 #include <linux/types.h>
 #include <linux/list.h>
 #include <linux/rbtree.h>
@@ -44,8 +43,6 @@
 
 #include "ubi-media.h"
 
-//#define MTK_TMP_DEBUG_LOG
-
 /* Maximum number of supported UBI devices */
 #define UBI_MAX_DEVICES 32
 
@@ -53,7 +50,7 @@
 #define UBI_NAME_STR "ubi"
 
 /* Normal UBI messages */
-#define ubi_msg(fmt, ...) pr_notice("UBI[%d]: " fmt "\n", ubi->ubi_num, ##__VA_ARGS__)
+#define ubi_msg(fmt, ...) pr_notice("UBI: " fmt "\n", ##__VA_ARGS__)
 /* UBI warning messages */
 #define ubi_warn(fmt, ...) pr_warn("UBI warning: %s: " fmt "\n",  \
 				   __func__, ##__VA_ARGS__)
@@ -429,6 +426,8 @@ struct ubi_debug_info {
  * @fm_size: fastmap size in bytes
  * @fm_sem: allows ubi_update_fastmap() to block EBA table changes
  * @fm_work: fastmap work queue
+ * @fm_work_scheduled: non-zero if fastmap work was scheduled
+ * @fast_attach: non-zero if UBI was attached by fastmap
  *
  * @used: RB-tree of used physical eraseblocks
  * @erroneous: RB-tree of erroneous used physical eraseblocks
@@ -440,9 +439,10 @@ struct ubi_debug_info {
  * @pq_head: protection queue head
  * @wl_lock: protects the @used, @free, @pq, @pq_head, @lookuptbl, @move_from,
  *	     @move_to, @move_to_put @erase_pending, @wl_scheduled, @works,
- *	     @erroneous, and @erroneous_peb_count fields
+ *	     @erroneous, @erroneous_peb_count, and @fm_work_scheduled fields
  * @move_mutex: serializes eraseblock moves
- * @work_sem: synchronizes the WL worker with use tasks
+ * @work_sem: used to wait for all the scheduled works to finish and prevent
+ * new works from being submitted
  * @wl_scheduled: non-zero if the wear-leveling was scheduled
  * @lookuptbl: a table to quickly find a &struct ubi_wl_entry object for any
  *             physical eraseblock
@@ -517,18 +517,6 @@ struct ubi_device {
 	int max_ec;
 	/* Note, mean_ec is not updated run-time - should be fixed */
 	int mean_ec;
-//MTK start: wl/ec status
-	uint64_t ec_sum;
-	int wl_count;
-	uint64_t wl_size;
-	int scrub_count;
-	uint64_t scrub_size;
-	int wl_th;
-	int torture;
-	atomic_t ec_count;
-	atomic_t move_retry;
-	atomic_t lbb;
-//MTK end
 
 	/* EBA sub-system's stuff */
 	unsigned long long global_sqnum;
@@ -546,6 +534,8 @@ struct ubi_device {
 	void *fm_buf;
 	size_t fm_size;
 	struct work_struct fm_work;
+	int fm_work_scheduled;
+	int fast_attach;
 
 	/* Wear-leveling sub-system's stuff */
 	struct rb_root used;
@@ -598,18 +588,6 @@ struct ubi_device {
 	struct mutex ckvol_mutex;
 
 	struct ubi_debug_info dbg;
-#ifdef CONFIG_BLB
-	int next_offset[2];
-	int leb_scrub[2];
-	struct mutex blb_mutex;
-	void *databuf;
-	void *oobbuf;
-	int scaning;
-#endif
-#ifdef MTK_IPOH_SUPPORT
-	int ipoh_ops;
-#endif
-
 };
 
 /**
@@ -685,7 +663,6 @@ struct ubi_ainf_volume {
  * @erase: list of physical eraseblocks which have to be erased
  * @alien: list of physical eraseblocks which should not be used by UBI (e.g.,
  *         those belonging to "preserve"-compatible internal volumes)
- * @waiting: list of physical eraseblocks which mabybe fix by BACKUP_LSB
  * @corr_peb_count: count of PEBs in the @corr list
  * @empty_peb_count: count of PEBs which are presumably empty (contain only
  *                   0xFF bytes)
@@ -714,9 +691,6 @@ struct ubi_attach_info {
 	struct list_head free;
 	struct list_head erase;
 	struct list_head alien;
-#ifdef CONFIG_BLB
-	struct list_head waiting;
-#endif
 	int corr_peb_count;
 	int empty_peb_count;
 	int alien_peb_count;
@@ -744,14 +718,15 @@ struct ubi_attach_info {
  * @torture: if the physical eraseblock has to be tortured
  * @anchor: produce a anchor PEB to by used by fastmap
  *
- * The @func pointer points to the worker function. If the @cancel argument is
- * not zero, the worker has to free the resources and exit immediately. The
- * worker has to return zero in case of success and a negative error code in
+ * The @func pointer points to the worker function. If the @shutdown argument is
+ * not zero, the worker has to free the resources and exit immediately as the
+ * WL sub-system is shutting down.
+ * The worker has to return zero in case of success and a negative error code in
  * case of failure.
  */
 struct ubi_work {
 	struct list_head list;
-	int (*func)(struct ubi_device *ubi, struct ubi_work *wrk, int cancel);
+	int (*func)(struct ubi_device *ubi, struct ubi_work *wrk, int shutdown);
 	/* The below fields are only relevant to erasure works */
 	struct ubi_wl_entry *e;
 	int vol_id;
@@ -815,9 +790,6 @@ void ubi_calculate_reserved(struct ubi_device *ubi);
 int ubi_check_pattern(const void *buf, uint8_t patt, int size);
 
 /* eba.c */
-#ifdef CONFIG_BLB
-int ubi_get_compat(const struct ubi_device *ubi, int vol_id);
-#endif
 int ubi_eba_unmap_leb(struct ubi_device *ubi, struct ubi_volume *vol,
 		      int lnum);
 int ubi_eba_read_leb(struct ubi_device *ubi, struct ubi_volume *vol, int lnum,
@@ -829,7 +801,7 @@ int ubi_eba_write_leb_st(struct ubi_device *ubi, struct ubi_volume *vol,
 int ubi_eba_atomic_leb_change(struct ubi_device *ubi, struct ubi_volume *vol,
 			      int lnum, const void *buf, int len);
 int ubi_eba_copy_leb(struct ubi_device *ubi, int from, int to,
-		     struct ubi_vid_hdr *vid_hdr, int do_wl);
+		     struct ubi_vid_hdr *vid_hdr);
 int ubi_eba_init(struct ubi_device *ubi, struct ubi_attach_info *ai);
 unsigned long long ubi_next_sqnum(struct ubi_device *ubi);
 int self_check_eba(struct ubi_device *ubi, struct ubi_attach_info *ai_fastmap,
@@ -850,8 +822,6 @@ int ubi_wl_put_fm_peb(struct ubi_device *ubi, struct ubi_wl_entry *used_e,
 int ubi_is_erase_work(struct ubi_work *wrk);
 void ubi_refill_pools(struct ubi_device *ubi);
 int ubi_ensure_anchor_pebs(struct ubi_device *ubi);
-int sync_erase(struct ubi_device *ubi, struct ubi_wl_entry *e, int torture);
-void ubi_wl_move_pg_to_used(struct ubi_device *ubi, int pnum);
 
 /* io.c */
 int ubi_io_read(const struct ubi_device *ubi, void *buf, int pnum, int offset,
@@ -869,15 +839,6 @@ int ubi_io_read_vid_hdr(struct ubi_device *ubi, int pnum,
 			struct ubi_vid_hdr *vid_hdr, int verbose);
 int ubi_io_write_vid_hdr(struct ubi_device *ubi, int pnum,
 			 struct ubi_vid_hdr *vid_hdr);
-#ifdef CONFIG_BLB
-int ubi_io_write_vid_hdr_blb(struct ubi_device *ubi, int pnum,
-			 struct ubi_vid_hdr *vid_hdr);
-int ubi_backup_init_scan(struct ubi_device *ubi, struct ubi_attach_info *ai);
-int ubi_io_read_oob(const struct ubi_device *ubi, void *databuf, void *oobbuf,
-		    int pnum, int offset);
-int ubi_io_write_oob(const struct ubi_device *ubi, void *databuf, void *oobbuf,
-		    int pnum, int offset);
-#endif
 
 /* build.c */
 int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
@@ -907,6 +868,26 @@ size_t ubi_calc_fm_size(struct ubi_device *ubi);
 int ubi_update_fastmap(struct ubi_device *ubi);
 int ubi_scan_fastmap(struct ubi_device *ubi, struct ubi_attach_info *ai,
 		     int fm_anchor);
+
+/* block.c */
+#ifdef CONFIG_MTD_UBI_BLOCK
+int ubiblock_init(void);
+void ubiblock_exit(void);
+int ubiblock_create(struct ubi_volume_info *vi);
+int ubiblock_remove(struct ubi_volume_info *vi);
+#else
+static inline int ubiblock_init(void) { return 0; }
+static inline void ubiblock_exit(void) {}
+static inline int ubiblock_create(struct ubi_volume_info *vi)
+{
+	return -ENOSYS;
+}
+static inline int ubiblock_remove(struct ubi_volume_info *vi)
+{
+	return -ENOSYS;
+}
+#endif
+
 
 /*
  * ubi_rb_for_each_entry - walk an RB-tree.

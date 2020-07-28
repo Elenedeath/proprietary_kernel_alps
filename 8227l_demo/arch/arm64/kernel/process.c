@@ -41,12 +41,10 @@
 #include <linux/uaccess.h>
 #include <linux/random.h>
 #include <linux/hw_breakpoint.h>
-#include <linux/cpuidle.h>
-#include <linux/leds.h>
 #include <linux/personality.h>
 #include <linux/notifier.h>
-#include <linux/mtk_ram_console.h>
 
+#include <asm/alternative.h>
 #include <asm/compat.h>
 #include <asm/cacheflush.h>
 #include <asm/fpsimd.h>
@@ -54,32 +52,11 @@
 #include <asm/processor.h>
 #include <asm/stacktrace.h>
 
-extern void arch_reset(char mode, const char *cmd);
-
-static void setup_restart(void)
-{
-	/*
-	 * Tell the mm system that we are going to reboot -
-	 * we may need it to insert some 1:1 mappings so that
-	 * soft boot works.
-	 */
-	setup_mm_for_reboot();
-
-	/* Clean and invalidate caches */
-	flush_cache_all();
-
-	/* Turn D-cache off */
-	cpu_cache_off();
-
-	/* Push out any further dirty data, and ensure cache is empty */
-	flush_cache_all();
-}
-
-void soft_restart(unsigned long addr)
-{
-	setup_restart();
-	cpu_reset(addr);
-}
+#ifdef CONFIG_CC_STACKPROTECTOR
+#include <linux/stackprotector.h>
+unsigned long __stack_chk_guard __read_mostly;
+EXPORT_SYMBOL(__stack_chk_guard);
+#endif
 
 /*
  * Function pointers to optional machine specific functions
@@ -87,42 +64,19 @@ void soft_restart(unsigned long addr)
 void (*pm_power_off)(void);
 EXPORT_SYMBOL_GPL(pm_power_off);
 
-void (*arm_pm_restart)(char str, const char *cmd);
-EXPORT_SYMBOL_GPL(arm_pm_restart);
+void (*arm_pm_restart)(enum reboot_mode reboot_mode, const char *cmd);
 
 /*
  * This is our default idle handler.
  */
-
-void (*arm_pm_idle)(void);	 
-
-static void default_idle(void)
+void arch_cpu_idle(void)
 {
-	if (arm_pm_idle)
-		arm_pm_idle();
-	else
-		cpu_do_idle();
+	/*
+	 * This should do all the clock switching and wait for interrupt
+	 * tricks
+	 */
+	cpu_do_idle();
 	local_irq_enable();
-}
-
-void arch_cpu_idle_prepare(void)
-{
-	local_fiq_enable();
-}
-
-void arch_cpu_idle_enter(void)
-{
-	idle_notifier_call_chain(IDLE_START);
-	ledtrig_cpu(CPU_LED_IDLE_START);
-#ifdef CONFIG_PL310_ERRATA_769419
-	wmb();
-#endif
-}
-
-void arch_cpu_idle_exit(void)
-{
-	ledtrig_cpu(CPU_LED_IDLE_END);
-	idle_notifier_call_chain(IDLE_END);
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -133,124 +87,66 @@ void arch_cpu_idle_dead(void)
 #endif
 
 /*
- * Called from the core idle loop.
+ * Called by kexec, immediately prior to machine_kexec().
+ *
+ * This must completely disable all secondary CPUs; simply causing those CPUs
+ * to execute e.g. a RAM-based pin loop is not sufficient. This allows the
+ * kexec'd kernel to use any and all RAM as it sees fit, without having to
+ * avoid any code or data used by any SW CPU pin loop. The CPU hotplug
+ * functionality embodied in disable_nonboot_cpus() to achieve this.
  */
-void arch_cpu_idle(void)
-{
-	if (cpuidle_idle_call())
-		default_idle();
-}
-
 void machine_shutdown(void)
 {
-#ifdef CONFIG_SMP
-	smp_send_stop();
-#endif
+	disable_nonboot_cpus();
 }
 
+/*
+ * Halting simply requires that the secondary CPUs stop performing any
+ * activity (executing tasks, handling interrupts). smp_send_stop()
+ * achieves this.
+ */
 void machine_halt(void)
 {
-	machine_shutdown();
+	local_irq_disable();
+	smp_send_stop();
 	while (1);
 }
 
-extern int reboot_pid;
-//static int reboot_pid = 0;
-
+/*
+ * Power-off simply requires that the secondary CPUs stop performing any
+ * activity (executing tasks, handling interrupts). smp_send_stop()
+ * achieves this. When the system power is turned off, it will take all CPUs
+ * with it.
+ */
 void machine_power_off(void)
 {
-	struct task_struct *tsk;
-	/* Disable interrupts first */
 	local_irq_disable();
-	local_fiq_disable();
-	
-	machine_shutdown();
-	if(reboot_pid > 1)
-	{
-		tsk = find_task_by_vpid(reboot_pid);
-		if(tsk == NULL)
-			tsk = current;		
-		dump_stack();
-	}
-	else
-	{
-		tsk = current;
-	}
-
-	if(tsk->real_parent)
-	{
-	 if(tsk->real_parent->real_parent)
-	 {
-	   printk("machine_shutdown: start, Proess(%s:%d). father %s:%d. grandfather %s:%d.\n",
-		tsk->comm, tsk->pid,tsk->real_parent->comm,tsk->real_parent->pid,
-		tsk->real_parent->real_parent->comm,tsk->real_parent->real_parent->pid);
-	 }
-	 else
-	 {
-	   printk("machine_shutdown: start, Proess(%s:%d). father %s:%d.\n", 
-		tsk->comm, tsk->pid,tsk->real_parent->comm,tsk->real_parent->pid);
-	 }
-	}
-	else
-	{
-	  printk("machine_shutdown: start, Proess(%s:%d)\n", tsk->comm, tsk->pid);	  
-	}
-
-#ifdef CONFIG_MTK_EMMC_SUPPORT 
-	last_kmsg_store_to_emmc();
-#endif
+	smp_send_stop();
 	if (pm_power_off)
 		pm_power_off();
 }
 
+/*
+ * Restart requires that the secondary CPUs stop performing any activity
+ * while the primary CPU resets the system. Systems with multiple CPUs must
+ * provide a HW restart implementation, to ensure that all CPUs reset at once.
+ * This is required so that any code running after reset on the primary CPU
+ * doesn't have to co-ordinate with other CPUs to ensure they aren't still
+ * executing pre-reset code, and using RAM that the primary CPU's code wishes
+ * to use. Implementing such co-ordination would be essentially impossible.
+ */
 void machine_restart(char *cmd)
 {
-	struct task_struct *tsk;	
-
 	/* Disable interrupts first */
 	local_irq_disable();
-	local_fiq_disable();
-	
-	machine_shutdown();
-
-	if(reboot_pid > 1)
-	{
-		tsk = find_task_by_vpid(reboot_pid);
-		if(tsk == NULL)
-			tsk = current;		
-		dump_stack();
-	}
-	else
-	{
-		tsk = current;
-	}
-
-	if(tsk->real_parent)
-	{
-	 if(tsk->real_parent->real_parent)
-	 {
-	   printk("machine_shutdown: start, Proess(%s:%d). father %s:%d. grandfather %s:%d.\n",
-		tsk->comm, tsk->pid,tsk->real_parent->comm,tsk->real_parent->pid,
-		tsk->real_parent->real_parent->comm,tsk->real_parent->real_parent->pid);
-	 }
-	 else
-	 {
-	   printk("machine_shutdown: start, Proess(%s:%d). father %s:%d.\n", 
-		tsk->comm, tsk->pid,tsk->real_parent->comm,tsk->real_parent->pid);
-	 }
-	}
-	else
-	{
-	  printk("machine_shutdown: start, Proess(%s:%d)\n", tsk->comm, tsk->pid);	  
-	}
+	smp_send_stop();
 
 	/* Now call the architecture specific reboot code. */
 	if (arm_pm_restart)
-		arm_pm_restart('h', cmd);
-#ifndef CONFIG_MTK_FPGA
+		arm_pm_restart(reboot_mode, cmd);
 	else
-		arch_reset('h', cmd);
-#endif
+		do_kernel_restart(cmd);
+
 	/*
 	 * Whoops - the architecture was unable to reboot.
 	 */
@@ -324,15 +220,26 @@ static void show_extra_register_data(struct pt_regs *regs, int nbytes)
 
 void __show_regs(struct pt_regs *regs)
 {
-	int i;
+	int i, top_reg;
+	u64 lr, sp;
+
+	if (compat_user_mode(regs)) {
+		lr = regs->compat_lr;
+		sp = regs->compat_sp;
+		top_reg = 12;
+	} else {
+		lr = regs->regs[30];
+		sp = regs->sp;
+		top_reg = 29;
+	}
 
 	show_regs_print_info(KERN_DEFAULT);
 	print_symbol("PC is at %s\n", instruction_pointer(regs));
-	print_symbol("LR is at %s\n", regs->regs[30]);
+	print_symbol("LR is at %s\n", lr);
 	printk("pc : [<%016llx>] lr : [<%016llx>] pstate: %08llx\n",
-	       regs->pc, regs->regs[30], regs->pstate);
-	printk("sp : %016llx\n", regs->sp);
-	for (i = 29; i >= 0; i--) {
+	       regs->pc, lr, regs->pstate);
+	printk("sp : %016llx\n", sp);
+	for (i = top_reg; i >= 0; i--) {
 		printk("x%-2d: %016llx ", i, regs->regs[i]);
 		if (i % 2 == 0)
 			printk("\n");
@@ -385,7 +292,8 @@ void release_thread(struct task_struct *dead_task)
 
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 {
-	fpsimd_preserve_current_state();
+	if (current->mm)
+		fpsimd_preserve_current_state();
 	*dst = *src;
 	return 0;
 }
@@ -399,6 +307,15 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	unsigned long tls = p->thread.tp_value;
 
 	memset(&p->thread.cpu_context, 0, sizeof(struct cpu_context));
+
+	/*
+	 * In case p was allocated the same task_struct pointer as some
+	 * other recently-exited task, make sure p is disassociated from
+	 * any cpu that may have run that now-exited task recently.
+	 * Otherwise we could erroneously skip reloading the FPSIMD
+	 * registers for p.
+	 */
+	fpsimd_flush_task_state(p);
 
 	if (likely(!(p->flags & PF_KTHREAD))) {
 		*childregs = *current_pt_regs();
@@ -428,6 +345,9 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 	} else {
 		memset(childregs, 0, sizeof(struct pt_regs));
 		childregs->pstate = PSR_MODE_EL1h;
+		if (IS_ENABLED(CONFIG_ARM64_UAO) &&
+		    cpus_have_cap(ARM64_HAS_UAO))
+			childregs->pstate |= PSR_UAO_BIT;
 		p->thread.cpu_context.x19 = stack_start;
 		p->thread.cpu_context.x20 = stk_sz;
 	}
@@ -442,25 +362,29 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
 
 static void tls_thread_switch(struct task_struct *next)
 {
-	unsigned long tpidr, tpidrro;
-
 	if (!is_compat_task()) {
+		unsigned long tpidr;
 		asm("mrs %0, tpidr_el0" : "=r" (tpidr));
 		current->thread.tp_value = tpidr;
 	}
 
-	if (is_compat_thread(task_thread_info(next))) {
-		tpidr = 0;
-		tpidrro = next->thread.tp_value;
-	} else {
-		tpidr = next->thread.tp_value;
-		tpidrro = 0;
-	}
+	if (is_compat_thread(task_thread_info(next)))
+		write_sysreg(next->thread.tp_value, tpidrro_el0);
+	else if (!arm64_kernel_unmapped_at_el0())
+		write_sysreg(0, tpidrro_el0);
 
-	asm(
-	"	msr	tpidr_el0, %0\n"
-	"	msr	tpidrro_el0, %1"
-	: : "r" (tpidr), "r" (tpidrro));
+	write_sysreg(next->thread.tp_value, tpidr_el0);
+}
+
+/* Restore the UAO state depending on next's addr_limit */
+static void uao_thread_switch(struct task_struct *next)
+{
+	if (IS_ENABLED(CONFIG_ARM64_UAO)) {
+		if (task_thread_info(next)->addr_limit == KERNEL_DS)
+			asm(ALTERNATIVE("nop", SET_PSTATE_UAO(1), ARM64_HAS_UAO));
+		else
+			asm(ALTERNATIVE("nop", SET_PSTATE_UAO(0), ARM64_HAS_UAO));
+	}
 }
 
 /*
@@ -475,12 +399,13 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	tls_thread_switch(next);
 	hw_breakpoint_thread_switch(next);
 	contextidr_thread_switch(next);
+	uao_thread_switch(next);
 
 	/*
 	 * Complete any pending TLB or cache maintenance on this CPU in case
 	 * the thread migrates to a different CPU.
 	 */
-	dsb();
+	dsb(ish);
 
 	/* the actual thread switch */
 	last = cpu_switch_to(prev, next);
@@ -491,6 +416,7 @@ struct task_struct *__switch_to(struct task_struct *prev,
 unsigned long get_wchan(struct task_struct *p)
 {
 	struct stackframe frame;
+	unsigned long stack_page;
 	int count = 0;
 	if (!p || p == current || p->state == TASK_RUNNING)
 		return 0;
@@ -498,9 +424,11 @@ unsigned long get_wchan(struct task_struct *p)
 	frame.fp = thread_saved_fp(p);
 	frame.sp = thread_saved_sp(p);
 	frame.pc = thread_saved_pc(p);
+	stack_page = (unsigned long)task_stack_page(p);
 	do {
-		int ret = unwind_frame(&frame);
-		if (ret < 0)
+		if (frame.sp < stack_page ||
+		    frame.sp >= stack_page + THREAD_SIZE ||
+		    unwind_frame(&frame))
 			return 0;
 		if (!in_sched_functions(frame.pc))
 			return frame.pc;
@@ -524,9 +452,4 @@ static unsigned long randomize_base(unsigned long base)
 unsigned long arch_randomize_brk(struct mm_struct *mm)
 {
 	return randomize_base(mm->brk);
-}
-
-unsigned long randomize_et_dyn(unsigned long base)
-{
-	return randomize_base(base);
 }

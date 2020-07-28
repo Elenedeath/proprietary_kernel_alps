@@ -137,16 +137,14 @@ struct snd_seq_client_port *snd_seq_create_port(struct snd_seq_client *client,
 		return NULL;
 
 	if (client->num_ports >= SNDRV_SEQ_MAX_PORTS - 1) {
-		snd_printk(KERN_WARNING "too many ports for client %d\n", client->number);
+		pr_warn("ALSA: seq: too many ports for client %d\n", client->number);
 		return NULL;
 	}
 
 	/* create a new port */
 	new_port = kzalloc(sizeof(*new_port), GFP_KERNEL);
-	if (! new_port) {
-		snd_printd("malloc failed for registering client port\n");
+	if (!new_port)
 		return NULL;	/* failure, out of memory */
-	}
 	/* init port data */
 	new_port->addr.client = client->number;
 	new_port->addr.port = -1;
@@ -555,10 +553,10 @@ static void delete_and_unsubscribe_port(struct snd_seq_client *client,
 		list_del_init(list);
 	grp->exclusive = 0;
 	write_unlock_irq(&grp->list_lock);
-	up_write(&grp->list_mutex);
 
 	if (!empty)
 		unsubscribe_port(client, port, grp, &subs->info, ack);
+	up_write(&grp->list_mutex);
 }
 
 /* connect two ports */

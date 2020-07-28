@@ -52,9 +52,10 @@ EXPORT_SYMBOL_GPL(sock_diag_put_meminfo);
 int sock_diag_put_filterinfo(bool may_report_filterinfo, struct sock *sk,
 			     struct sk_buff *skb, int attrtype)
 {
-	struct nlattr *attr;
+	struct sock_fprog_kern *fprog;
 	struct sk_filter *filter;
-	unsigned int len;
+	struct nlattr *attr;
+	unsigned int flen;
 	int err = 0;
 
 	if (!may_report_filterinfo) {
@@ -63,24 +64,20 @@ int sock_diag_put_filterinfo(bool may_report_filterinfo, struct sock *sk,
 	}
 
 	rcu_read_lock();
-
 	filter = rcu_dereference(sk->sk_filter);
-	len = filter ? filter->len * sizeof(struct sock_filter) : 0;
+	if (!filter)
+		goto out;
 
-	attr = nla_reserve(skb, attrtype, len);
+	fprog = filter->prog->orig_prog;
+	flen = bpf_classic_proglen(fprog);
+
+	attr = nla_reserve(skb, attrtype, flen);
 	if (attr == NULL) {
 		err = -EMSGSIZE;
 		goto out;
 	}
 
-	if (filter) {
-		struct sock_filter *fb = (struct sock_filter *)nla_data(attr);
-		int i;
-
-		for (i = 0; i < filter->len; i++, fb++)
-			sk_decode_filter(&filter->insns[i], fb);
-	}
-
+	memcpy(nla_data(attr), fprog->filter, flen);
 out:
 	rcu_read_unlock();
 	return err;
@@ -135,7 +132,7 @@ void sock_diag_unregister(const struct sock_diag_handler *hnld)
 }
 EXPORT_SYMBOL_GPL(sock_diag_unregister);
 
-static int __sock_diag_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+static int __sock_diag_cmd(struct sk_buff *skb, struct nlmsghdr *nlh)
 {
 	int err;
 	struct sock_diag_req *req = nlmsg_data(nlh);
@@ -155,8 +152,12 @@ static int __sock_diag_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 	hndl = sock_diag_handlers[req->sdiag_family];
 	if (hndl == NULL)
 		err = -ENOENT;
-	else
+	else if (nlh->nlmsg_type == SOCK_DIAG_BY_FAMILY)
 		err = hndl->dump(skb, nlh);
+	else if (nlh->nlmsg_type == SOCK_DESTROY_BACKPORT && hndl->destroy)
+		err = hndl->destroy(skb, nlh);
+	else
+		err = -EOPNOTSUPP;
 	mutex_unlock(&sock_diag_table_mutex);
 
 	return err;
@@ -182,7 +183,8 @@ static int sock_diag_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
 
 		return ret;
 	case SOCK_DIAG_BY_FAMILY:
-		return __sock_diag_rcv_msg(skb, nlh);
+	case SOCK_DESTROY_BACKPORT:
+		return __sock_diag_cmd(skb, nlh);
 	default:
 		return -EINVAL;
 	}
@@ -196,6 +198,18 @@ static void sock_diag_rcv(struct sk_buff *skb)
 	netlink_rcv_skb(skb, &sock_diag_rcv_msg);
 	mutex_unlock(&sock_diag_mutex);
 }
+
+int sock_diag_destroy(struct sock *sk, int err)
+{
+	if (!ns_capable(sock_net(sk)->user_ns, CAP_NET_ADMIN))
+		return -EPERM;
+
+	if (!sk->sk_prot->diag_destroy)
+		return -EOPNOTSUPP;
+
+	return sk->sk_prot->diag_destroy(sk, err);
+}
+EXPORT_SYMBOL_GPL(sock_diag_destroy);
 
 static int __net_init diag_net_init(struct net *net)
 {

@@ -339,7 +339,8 @@ static unsigned long lance_probe1( struct net_device *dev, struct lance_addr
                                    *init_rec );
 static int lance_open( struct net_device *dev );
 static void lance_init_ring( struct net_device *dev );
-static int lance_start_xmit( struct sk_buff *skb, struct net_device *dev );
+static netdev_tx_t lance_start_xmit(struct sk_buff *skb,
+				    struct net_device *dev);
 static irqreturn_t lance_interrupt( int irq, void *dev_id );
 static int lance_rx( struct net_device *dev );
 static int lance_close( struct net_device *dev );
@@ -586,10 +587,10 @@ static unsigned long __init lance_probe1( struct net_device *dev,
 	switch( lp->cardtype ) {
 	  case OLD_RIEBL:
 		/* No ethernet address! (Set some default address) */
-		memcpy( dev->dev_addr, OldRieblDefHwaddr, 6 );
+		memcpy(dev->dev_addr, OldRieblDefHwaddr, ETH_ALEN);
 		break;
 	  case NEW_RIEBL:
-		lp->memcpy_f( dev->dev_addr, RIEBL_HWADDR_ADDR, 6 );
+		lp->memcpy_f(dev->dev_addr, RIEBL_HWADDR_ADDR, ETH_ALEN);
 		break;
 	  case PAM_CARD:
 		i = IO->eeprom;
@@ -770,7 +771,8 @@ static void lance_tx_timeout (struct net_device *dev)
 
 /* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
 
-static int lance_start_xmit( struct sk_buff *skb, struct net_device *dev )
+static netdev_tx_t
+lance_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct lance_private *lp = netdev_priv(dev);
 	struct lance_ioreg	 *IO = lp->iobase;
@@ -1147,7 +1149,7 @@ static struct net_device *atarilance_dev;
 static int __init atarilance_module_init(void)
 {
 	atarilance_dev = atarilance_probe(-1);
-	return PTR_RET(atarilance_dev);
+	return PTR_ERR_OR_ZERO(atarilance_dev);
 }
 
 static void __exit atarilance_module_exit(void)

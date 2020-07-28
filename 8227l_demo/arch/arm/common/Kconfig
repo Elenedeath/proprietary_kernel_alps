@@ -18,6 +18,5 @@ config SHARP_PARAM
 config SHARP_SCOOP
 	bool
 
-config FIQ_GLUE
+config TI_PRIV_EDMA
 	bool
-	select FIQ

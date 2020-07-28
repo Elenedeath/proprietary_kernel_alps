@@ -12,7 +12,7 @@
 #ifndef _ASM_SYSCALL_H
 #define _ASM_SYSCALL_H	1
 
-#include <linux/audit.h>
+#include <uapi/linux/audit.h>
 #include <linux/sched.h>
 #include <linux/err.h>
 #include <asm/ptrace.h>
@@ -28,7 +28,7 @@ extern const unsigned int sys_call_table_emu[];
 static inline long syscall_get_nr(struct task_struct *task,
 				  struct pt_regs *regs)
 {
-	return test_tsk_thread_flag(task, TIF_SYSCALL) ?
+	return test_pt_regs_flag(regs, PIF_SYSCALL) ?
 		(regs->int_code & 0xffff) : -1;
 }
 
@@ -63,6 +63,12 @@ static inline void syscall_get_arguments(struct task_struct *task,
 					 unsigned long *args)
 {
 	unsigned long mask = -1UL;
+
+	/*
+	 * No arguments for this syscall, there's nothing to do.
+	 */
+	if (!n)
+		return;
 
 	BUG_ON(i + n > 6);
 #ifdef CONFIG_COMPAT

@@ -38,6 +38,7 @@
 			compatible = "arm,cortex-a15";
 			reg = <0>;
 			cci-control-port = <&cci_control1>;
+			cpu-idle-states = <&CLUSTER_SLEEP_BIG>;
 		};
 
 		cpu1: cpu@1 {
@@ -45,6 +46,7 @@
 			compatible = "arm,cortex-a15";
 			reg = <1>;
 			cci-control-port = <&cci_control1>;
+			cpu-idle-states = <&CLUSTER_SLEEP_BIG>;
 		};
 
 		cpu2: cpu@2 {
@@ -52,6 +54,7 @@
 			compatible = "arm,cortex-a7";
 			reg = <0x100>;
 			cci-control-port = <&cci_control2>;
+			cpu-idle-states = <&CLUSTER_SLEEP_LITTLE>;
 		};
 
 		cpu3: cpu@3 {
@@ -59,6 +62,7 @@
 			compatible = "arm,cortex-a7";
 			reg = <0x101>;
 			cci-control-port = <&cci_control2>;
+			cpu-idle-states = <&CLUSTER_SLEEP_LITTLE>;
 		};
 
 		cpu4: cpu@4 {
@@ -66,6 +70,25 @@
 			compatible = "arm,cortex-a7";
 			reg = <0x102>;
 			cci-control-port = <&cci_control2>;
+			cpu-idle-states = <&CLUSTER_SLEEP_LITTLE>;
+		};
+
+		idle-states {
+			CLUSTER_SLEEP_BIG: cluster-sleep-big {
+				compatible = "arm,idle-state";
+				local-timer-stop;
+				entry-latency-us = <1000>;
+				exit-latency-us = <700>;
+				min-residency-us = <2000>;
+			};
+
+			CLUSTER_SLEEP_LITTLE: cluster-sleep-little {
+				compatible = "arm,idle-state";
+				local-timer-stop;
+				entry-latency-us = <1000>;
+				exit-latency-us = <500>;
+				min-residency-us = <2500>;
+			};
 		};
 	};
 
@@ -129,16 +152,6 @@
 		};
 	};
 
-	cci-pmu@2c099000 {
-		compatible = "arm,cci-400-pmu";
-		reg = <0 0x2c099000 0 0x6000>;
-		interrupts = <0 101 4>,
-			     <0 102 4>,
-			     <0 103 4>,
-			     <0 104 4>,
-			     <0 105 4>;
-	};
-
 	memory-controller@7ffd0000 {
 		compatible = "arm,pl354", "arm,primecell";
 		reg = <0 0x7ffd0000 0 0x1000>;
@@ -159,6 +172,12 @@
 		clocks = <&oscclk6a>;
 		clock-names = "apb_pclk";
 	};
+
+        scc@7fff0000 {
+		compatible = "arm,vexpress-scc,v2p-ca15_a7", "arm,vexpress-scc";
+		reg = <0 0x7fff0000 0 0x1000>;
+		interrupts = <0 95 4>;
+        };
 
 	timer {
 		compatible = "arm,armv7-timer";
@@ -316,6 +335,7 @@
 			arm,vexpress-sysreg,func = <12 0>;
 			label = "A15 Pcore";
 		};
+
 		power@1 {
 			/* Total power for the three A7 cores */
 			compatible = "arm,vexpress-power";
@@ -326,14 +346,14 @@
 		energy@0 {
 			/* Total energy for the two A15 cores */
 			compatible = "arm,vexpress-energy";
-			arm,vexpress-sysreg,func = <13 0>;
+			arm,vexpress-sysreg,func = <13 0>, <13 1>;
 			label = "A15 Jcore";
 		};
 
 		energy@2 {
 			/* Total energy for the three A7 cores */
 			compatible = "arm,vexpress-energy";
-			arm,vexpress-sysreg,func = <13 2>;
+			arm,vexpress-sysreg,func = <13 2>, <13 3>;
 			label = "A7 Jcore";
 		};
 	};

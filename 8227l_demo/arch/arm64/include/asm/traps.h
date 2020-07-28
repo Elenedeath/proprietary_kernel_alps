@@ -20,22 +20,19 @@
 
 #include <linux/list.h>
 
+struct pt_regs;
+
 struct undef_hook {
 	struct list_head node;
 	u32 instr_mask;
 	u32 instr_val;
-	u32 pstate_mask;
-	u32 pstate_val;
-	int (*fn)(struct pt_regs *regs, unsigned int instr);
+	u64 pstate_mask;
+	u64 pstate_val;
+	int (*fn)(struct pt_regs *regs, u32 instr);
 };
 
 void register_undef_hook(struct undef_hook *hook);
-
-#ifdef CONFIG_MEDIATEK_SOLUTION
-struct pt_regs;
-
-int register_async_abort_handler(void (*fn)(struct pt_regs *regs, void *), void *priv);
-#endif
+void unregister_undef_hook(struct undef_hook *hook);
 
 static inline int in_exception_text(unsigned long ptr)
 {

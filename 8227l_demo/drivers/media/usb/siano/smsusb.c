@@ -206,28 +206,22 @@ static int smsusb_start_streaming(struct smsusb_device_t *dev)
 static int smsusb_sendrequest(void *context, void *buffer, size_t size)
 {
 	struct smsusb_device_t *dev = (struct smsusb_device_t *) context;
-	struct sms_msg_hdr *phdr;
-	int dummy, ret;
+	struct sms_msg_hdr *phdr = (struct sms_msg_hdr *) buffer;
+	int dummy;
 
-	if (dev->state != SMSUSB_ACTIVE)
+	if (dev->state != SMSUSB_ACTIVE) {
+		sms_debug("Device not active yet");
 		return -ENOENT;
-
-	phdr = kmalloc(size, GFP_KERNEL);
-	if (!phdr)
-		return -ENOMEM;
-	memcpy(phdr, buffer, size);
+	}
 
 	sms_debug("sending %s(%d) size: %d",
 		  smscore_translate_msg(phdr->msg_type), phdr->msg_type,
 		  phdr->msg_length);
 
 	smsendian_handle_tx_message((struct sms_msg_data *) phdr);
-	smsendian_handle_message_header((struct sms_msg_hdr *)phdr);
-	ret = usb_bulk_msg(dev->udev, usb_sndbulkpipe(dev->udev, 2),
-			    phdr, size, &dummy, 1000);
-
-	kfree(phdr);
-	return ret;
+	smsendian_handle_message_header((struct sms_msg_hdr *)buffer);
+	return usb_bulk_msg(dev->udev, usb_sndbulkpipe(dev->udev, 2),
+			    buffer, size, &dummy, 1000);
 }
 
 static char *smsusb1_fw_lkup[] = {
@@ -250,6 +244,9 @@ static int smsusb1_load_firmware(struct usb_device *udev, int id, int board_id)
 	u8 *fw_buffer;
 	int rc, dummy;
 	char *fw_filename;
+
+	if (id < 0)
+		id = sms_get_board(board_id)->default_mode;
 
 	if (id < DEVICE_MODE_DVBT || id > DEVICE_MODE_DVBT_BDA) {
 		sms_err("invalid firmware id specified %d", id);
@@ -280,14 +277,14 @@ static int smsusb1_load_firmware(struct usb_device *udev, int id, int board_id)
 		rc = usb_bulk_msg(udev, usb_sndbulkpipe(udev, 2),
 				  fw_buffer, fw->size, &dummy, 1000);
 
-		sms_info("sent %zd(%d) bytes, rc %d", fw->size, dummy, rc);
+		sms_info("sent %zu(%d) bytes, rc %d", fw->size, dummy, rc);
 
 		kfree(fw_buffer);
 	} else {
 		sms_err("failed to allocate firmware buffer");
 		rc = -ENOMEM;
 	}
-	sms_info("read FW %s, size=%zd", fw_filename, fw->size);
+	sms_info("read FW %s, size=%zu", fw_filename, fw->size);
 
 	release_firmware(fw);
 
@@ -354,6 +351,7 @@ static int smsusb_init_device(struct usb_interface *intf, int board_id)
 	struct smsdevice_params_t params;
 	struct smsusb_device_t *dev;
 	int i, rc;
+	int align = 0;
 
 	/* create device object */
 	dev = kzalloc(sizeof(struct smsusb_device_t), GFP_KERNEL);
@@ -366,6 +364,23 @@ static int smsusb_init_device(struct usb_interface *intf, int board_id)
 	usb_set_intfdata(intf, dev);
 	dev->udev = interface_to_usbdev(intf);
 	dev->state = SMSUSB_DISCONNECTED;
+
+	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
+		struct usb_endpoint_descriptor *desc =
+				&intf->cur_altsetting->endpoint[i].desc;
+
+		if (desc->bEndpointAddress & USB_DIR_IN) {
+			dev->in_ep = desc->bEndpointAddress;
+			align = usb_endpoint_maxp(desc) - sizeof(struct sms_msg_hdr);
+		} else {
+			dev->out_ep = desc->bEndpointAddress;
+		}
+	}
+
+	if (!dev->in_ep || !dev->out_ep || align < 0) {	/* Missing endpoints? */
+		smsusb_term_device(intf);
+		return -ENODEV;
+	}
 
 	params.device_type = sms_get_board(board_id)->type;
 
@@ -381,23 +396,11 @@ static int smsusb_init_device(struct usb_interface *intf, int board_id)
 		/* fall-thru */
 	default:
 		dev->buffer_size = USB2_BUFFER_SIZE;
-		dev->response_alignment =
-		    le16_to_cpu(dev->udev->ep_in[1]->desc.wMaxPacketSize) -
-		    sizeof(struct sms_msg_hdr);
+		dev->response_alignment = align;
 
 		params.flags |= SMS_DEVICE_FAMILY2;
 		break;
 	}
-
-	for (i = 0; i < intf->cur_altsetting->desc.bNumEndpoints; i++) {
-		if (intf->cur_altsetting->endpoint[i].desc. bEndpointAddress & USB_DIR_IN)
-			dev->in_ep = intf->cur_altsetting->endpoint[i].desc.bEndpointAddress;
-		else
-			dev->out_ep = intf->cur_altsetting->endpoint[i].desc.bEndpointAddress;
-	}
-
-	sms_info("in_ep = %02x, out_ep = %02x",
-		dev->in_ep, dev->out_ep);
 
 	params.device = &dev->udev->dev;
 	params.buffer_size = dev->buffer_size;
@@ -453,14 +456,15 @@ static int smsusb_probe(struct usb_interface *intf,
 	char devpath[32];
 	int i, rc;
 
-	sms_info("interface number %d",
+	sms_info("board id=%lu, interface number %d",
+		 id->driver_info,
 		 intf->cur_altsetting->desc.bInterfaceNumber);
 
 	if (sms_get_board(id->driver_info)->intf_num !=
 	    intf->cur_altsetting->desc.bInterfaceNumber) {
-		sms_err("interface number is %d expecting %d",
-			sms_get_board(id->driver_info)->intf_num,
-			intf->cur_altsetting->desc.bInterfaceNumber);
+		sms_debug("interface %d won't be used. Expecting interface %d to popup",
+			intf->cur_altsetting->desc.bInterfaceNumber,
+			sms_get_board(id->driver_info)->intf_num);
 		return -ENODEV;
 	}
 
@@ -491,22 +495,32 @@ static int smsusb_probe(struct usb_interface *intf,
 	}
 	if ((udev->actconfig->desc.bNumInterfaces == 2) &&
 	    (intf->cur_altsetting->desc.bInterfaceNumber == 0)) {
-		sms_err("rom interface 0 is not used");
+		sms_debug("rom interface 0 is not used");
 		return -ENODEV;
 	}
 
 	if (id->driver_info == SMS1XXX_BOARD_SIANO_STELLAR_ROM) {
-		sms_info("stellar device was found.");
+		/* Detected a Siano Stellar uninitialized */
+
 		snprintf(devpath, sizeof(devpath), "usb\\%d-%s",
 			 udev->bus->busnum, udev->devpath);
-		sms_info("stellar device was found.");
-		return smsusb1_load_firmware(
+		sms_info("stellar device in cold state was found at %s.", devpath);
+		rc = smsusb1_load_firmware(
 				udev, smscore_registry_getmode(devpath),
 				id->driver_info);
+
+		/* This device will reset and gain another USB ID */
+		if (!rc)
+			sms_info("stellar device now in warm state");
+		else
+			sms_err("Failed to put stellar in warm state. Error: %d", rc);
+
+		return rc;
+	} else {
+		rc = smsusb_init_device(intf, id->driver_info);
 	}
 
-	rc = smsusb_init_device(intf, id->driver_info);
-	sms_info("rc %d", rc);
+	sms_info("Device initialized with return code %d", rc);
 	sms_board_load_modules(id->driver_info);
 	return rc;
 }
@@ -558,10 +572,13 @@ static int smsusb_resume(struct usb_interface *intf)
 }
 
 static const struct usb_device_id smsusb_id_table[] = {
+	/* This device is only present before firmware load */
 	{ USB_DEVICE(0x187f, 0x0010),
-		.driver_info = SMS1XXX_BOARD_SIANO_STELLAR },
+		.driver_info = SMS1XXX_BOARD_SIANO_STELLAR_ROM },
+	/* This device pops up after firmware load */
 	{ USB_DEVICE(0x187f, 0x0100),
 		.driver_info = SMS1XXX_BOARD_SIANO_STELLAR },
+
 	{ USB_DEVICE(0x187f, 0x0200),
 		.driver_info = SMS1XXX_BOARD_SIANO_NOVA_A },
 	{ USB_DEVICE(0x187f, 0x0201),
@@ -642,6 +659,10 @@ static const struct usb_device_id smsusb_id_table[] = {
 		.driver_info = SMS1XXX_BOARD_ZTE_DVB_DATA_CARD },
 	{ USB_DEVICE(0x19D2, 0x0078),
 		.driver_info = SMS1XXX_BOARD_ONDA_MDTV_DATA_CARD },
+	{ USB_DEVICE(0x3275, 0x0080),
+		.driver_info = SMS1XXX_BOARD_SIANO_RIO },
+	{ USB_DEVICE(0x2013, 0x0257),
+		.driver_info = SMS1XXX_BOARD_PCTV_77E },
 	{ } /* Terminating entry */
 	};
 

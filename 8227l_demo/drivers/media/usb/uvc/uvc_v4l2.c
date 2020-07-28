@@ -498,15 +498,19 @@ static int uvc_v4l2_open(struct file *file)
 		return -ENOMEM;
 	}
 
-	if (atomic_inc_return(&stream->dev->users) == 1) {
-		ret = uvc_status_start(stream->dev);
+	mutex_lock(&stream->dev->lock);
+	if (stream->dev->users == 0) {
+		ret = uvc_status_start(stream->dev, GFP_KERNEL);
 		if (ret < 0) {
-			atomic_dec(&stream->dev->users);
+			mutex_unlock(&stream->dev->lock);
 			usb_autopm_put_interface(stream->dev->intf);
 			kfree(handle);
 			return ret;
 		}
 	}
+
+	stream->dev->users++;
+	mutex_unlock(&stream->dev->lock);
 
 	v4l2_fh_init(&handle->vfh, stream->vdev);
 	v4l2_fh_add(&handle->vfh);
@@ -538,8 +542,10 @@ static int uvc_v4l2_release(struct file *file)
 	kfree(handle);
 	file->private_data = NULL;
 
-	if (atomic_dec_return(&stream->dev->users) == 0)
+	mutex_lock(&stream->dev->lock);
+	if (--stream->dev->users == 0)
 		uvc_status_stop(stream->dev);
+	mutex_unlock(&stream->dev->lock);
 
 	usb_autopm_put_interface(stream->dev->intf);
 	return 0;
@@ -994,6 +1000,17 @@ static long uvc_v4l2_do_ioctl(struct file *file, unsigned int cmd, void *arg)
 		return uvc_query_buffer(&stream->queue, buf);
 	}
 
+	case VIDIOC_CREATE_BUFS:
+	{
+		struct v4l2_create_buffers *cb = arg;
+
+		ret = uvc_acquire_privileges(handle);
+		if (ret < 0)
+			return ret;
+
+		return uvc_create_buffers(&stream->queue, cb);
+	}
+
 	case VIDIOC_QBUF:
 		if (!uvc_has_privileges(handle))
 			return -EBUSY;
@@ -1262,45 +1279,42 @@ static int uvc_v4l2_put_xu_query(const struct uvc_xu_control_query *kp,
 static long uvc_v4l2_compat_ioctl32(struct file *file,
 		     unsigned int cmd, unsigned long arg)
 {
+	struct uvc_fh *handle = file->private_data;
 	union {
 		struct uvc_xu_control_mapping xmap;
 		struct uvc_xu_control_query xqry;
 	} karg;
 	void __user *up = compat_ptr(arg);
-	mm_segment_t old_fs;
 	long ret;
 
 	switch (cmd) {
 	case UVCIOC_CTRL_MAP32:
-		cmd = UVCIOC_CTRL_MAP;
 		ret = uvc_v4l2_get_xu_mapping(&karg.xmap, up);
+		if (ret)
+			return ret;
+		ret = uvc_ioctl_ctrl_map(handle->chain, &karg.xmap);
+		if (ret)
+			return ret;
+		ret = uvc_v4l2_put_xu_mapping(&karg.xmap, up);
+		if (ret)
+			return ret;
+
 		break;
 
 	case UVCIOC_CTRL_QUERY32:
-		cmd = UVCIOC_CTRL_QUERY;
 		ret = uvc_v4l2_get_xu_query(&karg.xqry, up);
+		if (ret)
+			return ret;
+		ret = uvc_xu_ctrl_query(handle->chain, &karg.xqry);
+		if (ret)
+			return ret;
+		ret = uvc_v4l2_put_xu_query(&karg.xqry, up);
+		if (ret)
+			return ret;
 		break;
 
 	default:
 		return -ENOIOCTLCMD;
-	}
-
-	old_fs = get_fs();
-	set_fs(KERNEL_DS);
-	ret = uvc_v4l2_ioctl(file, cmd, (unsigned long)&karg);
-	set_fs(old_fs);
-
-	if (ret < 0)
-		return ret;
-
-	switch (cmd) {
-	case UVCIOC_CTRL_MAP:
-		ret = uvc_v4l2_put_xu_mapping(&karg.xmap, up);
-		break;
-
-	case UVCIOC_CTRL_QUERY:
-		ret = uvc_v4l2_put_xu_query(&karg.xqry, up);
-		break;
 	}
 
 	return ret;

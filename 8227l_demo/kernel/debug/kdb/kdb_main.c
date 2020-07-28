@@ -1091,7 +1091,7 @@ static int kdb_reboot(int argc, const char **argv)
 static void kdb_dumpregs(struct pt_regs *regs)
 {
 	int old_lvl = console_loglevel;
-	console_loglevel = 15;
+	console_loglevel = CONSOLE_LOGLEVEL_MOTORMOUTH;
 	kdb_trap_printk++;
 	show_regs(regs);
 	kdb_trap_printk--;
@@ -1109,11 +1109,6 @@ void kdb_set_current_task(struct task_struct *p)
 	}
 	kdb_current_regs = NULL;
 }
-
-/* Check timeout and force kernel panic if no user input for KE_TIMEOUT_SEC */
-int check_timeout;
-int force_panic;
-unsigned long long enter_time;
 
 /*
  * kdb_local - The main code for kdb.  This routine is invoked on a
@@ -1142,12 +1137,6 @@ static int kdb_local(kdb_reason_t reason, int error, struct pt_regs *regs,
 	struct task_struct *kdb_current =
 		kdb_curr_task(raw_smp_processor_id());
 
-	check_timeout = 1;
-	force_panic = 0;
-	enter_time = sched_clock();
-
-	get_cpu_var(kdb_in_use) = 1;
-	put_cpu_var(kdb_in_use);
 	KDB_DEBUG_STATE("kdb_local 1", reason);
 	kdb_go_count = 0;
 	if (reason == KDB_REASON_DEBUG) {
@@ -1210,6 +1199,9 @@ static int kdb_local(kdb_reason_t reason, int error, struct pt_regs *regs,
 		kdb_printf("due to oops @ " kdb_machreg_fmt "\n",
 			   instruction_pointer(regs));
 		kdb_dumpregs(regs);
+		break;
+	case KDB_REASON_SYSTEM_NMI:
+		kdb_printf("due to System NonMaskable Interrupt\n");
 		break;
 	case KDB_REASON_NMI:
 		kdb_printf("due to NonMaskable Interrupt @ "
@@ -1306,9 +1298,6 @@ do_full_getstr:
 			kdb_cmderror(diag);
 	}
 	KDB_DEBUG_STATE("kdb_local 9", diag);
-	get_cpu_var(kdb_in_use) = 0;
-	put_cpu_var(kdb_in_use);
-	
 	return diag;
 }
 
@@ -1535,6 +1524,7 @@ static int kdb_md(int argc, const char **argv)
 	int symbolic = 0;
 	int valid = 0;
 	int phys = 0;
+	int raw = 0;
 
 	kdbgetintenv("MDCOUNT", &mdcount);
 	kdbgetintenv("RADIX", &radix);
@@ -1544,9 +1534,10 @@ static int kdb_md(int argc, const char **argv)
 	repeat = mdcount * 16 / bytesperword;
 
 	if (strcmp(argv[0], "mdr") == 0) {
-		if (argc != 2)
+		if (argc == 2 || (argc == 0 && last_addr != 0))
+			valid = raw = 1;
+		else
 			return KDB_ARGCOUNT;
-		valid = 1;
 	} else if (isdigit(argv[0][2])) {
 		bytesperword = (int)(argv[0][2] - '0');
 		if (bytesperword == 0) {
@@ -1582,7 +1573,10 @@ static int kdb_md(int argc, const char **argv)
 		radix = last_radix;
 		bytesperword = last_bytesperword;
 		repeat = last_repeat;
-		mdcount = ((repeat * bytesperword) + 15) / 16;
+		if (raw)
+			mdcount = repeat;
+		else
+			mdcount = ((repeat * bytesperword) + 15) / 16;
 	}
 
 	if (argc) {
@@ -1599,7 +1593,10 @@ static int kdb_md(int argc, const char **argv)
 			diag = kdbgetularg(argv[nextarg], &val);
 			if (!diag) {
 				mdcount = (int) val;
-				repeat = mdcount * 16 / bytesperword;
+				if (raw)
+					repeat = mdcount;
+				else
+					repeat = mdcount * 16 / bytesperword;
 			}
 		}
 		if (argc >= nextarg+1) {
@@ -1609,8 +1606,15 @@ static int kdb_md(int argc, const char **argv)
 		}
 	}
 
-	if (strcmp(argv[0], "mdr") == 0)
-		return kdb_mdr(addr, mdcount);
+	if (strcmp(argv[0], "mdr") == 0) {
+		int ret;
+		last_addr = addr;
+		ret = kdb_mdr(addr, mdcount);
+		last_addr += mdcount;
+		last_repeat = mdcount;
+		last_bytesperword = bytesperword; // to make REPEAT happy
+		return ret;
+	}
 
 	switch (radix) {
 	case 10:
@@ -2483,7 +2487,7 @@ static void kdb_gmtime(struct timespec *tv, struct kdb_tm *tm)
 static void kdb_sysinfo(struct sysinfo *val)
 {
 	struct timespec uptime;
-	do_posix_clock_monotonic_gettime(&uptime);
+	ktime_get_ts(&uptime);
 	memset(val, 0, sizeof(*val));
 	val->uptime = uptime.tv_sec;
 	val->loads[0] = avenrun[0];
@@ -2580,7 +2584,7 @@ static int kdb_per_cpu(int argc, const char **argv)
 		diag = kdbgetularg(argv[3], &whichcpu);
 		if (diag)
 			return diag;
-		if (!cpu_online(whichcpu)) {
+		if (whichcpu >= nr_cpu_ids || !cpu_online(whichcpu)) {
 			kdb_printf("cpu %ld is not online\n", whichcpu);
 			return KDB_BADCPUNUM;
 		}
@@ -2867,10 +2871,6 @@ static void __init kdb_cmd_init(void)
 	}
 }
 
-#ifdef CONFIG_MTK_EXTMEM
-extern void init_debug_alloc_pool_aligned(void);
-#endif
-
 /* Initialize kdb_printf, breakpoint tables and kdb state */
 void __init kdb_init(int lvl)
 {
@@ -2879,11 +2879,6 @@ void __init kdb_init(int lvl)
 
 	if (kdb_init_lvl == KDB_INIT_FULL || lvl <= kdb_init_lvl)
 		return;
-
-#ifdef CONFIG_MTK_EXTMEM
-	init_debug_alloc_pool_aligned();
-#endif
-
 	for (i = kdb_init_lvl; i < lvl; i++) {
 		switch (i) {
 		case KDB_NOT_INITIALIZED:

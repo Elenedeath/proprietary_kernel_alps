@@ -44,16 +44,13 @@
  */
 #define UBIFS_KMALLOC_OK (128*1024)
 
-/*sync() when free size less than*/
-#define UFIFS_FREE_SIZE_SYNC_TH (10*1024*1024)
-static int ubifs_sync_fs(struct super_block *sb, int wait);
-/**/
 /* Slab cache for UBIFS inodes */
 struct kmem_cache *ubifs_inode_slab;
 
 /* UBIFS TNC shrinker description */
 static struct shrinker ubifs_shrinker_info = {
-	.shrink = ubifs_shrinker,
+	.scan_objects = ubifs_shrink_scan,
+	.count_objects = ubifs_shrink_count,
 	.seeks = DEFAULT_SEEKS,
 };
 
@@ -78,7 +75,7 @@ static int validate_inode(struct ubifs_info *c, const struct inode *inode)
 		return 1;
 	}
 
-	if (ui->compr_type < 0 || ui->compr_type >= UBIFS_COMPR_TYPES_CNT) {
+	if (ui->compr_type >= UBIFS_COMPR_TYPES_CNT) {
 		ubifs_err("unknown compression type %d", ui->compr_type);
 		return 2;
 	}
@@ -303,9 +300,7 @@ static int ubifs_write_inode(struct inode *inode, struct writeback_control *wbc)
 	if (is_bad_inode(inode))
 		return 0;
 
-	if(mutex_trylock(&ui->ui_mutex) == 0) {
-		return 0;
-	}
+	mutex_lock(&ui->ui_mutex);
 	/*
 	 * Due to races between write-back forced by budgeting
 	 * (see 'sync_some_inodes()') and background write-back, the inode may
@@ -356,7 +351,7 @@ static void ubifs_evict_inode(struct inode *inode)
 	dbg_gen("inode %lu, mode %#x", inode->i_ino, (int)inode->i_mode);
 	ubifs_assert(!atomic_read(&inode->i_count));
 
-	truncate_inode_pages(&inode->i_data, 0);
+	truncate_inode_pages_final(&inode->i_data);
 
 	if (inode->i_nlink)
 		goto done;
@@ -402,17 +397,11 @@ static int ubifs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	struct ubifs_info *c = dentry->d_sb->s_fs_info;
 	unsigned long long free;
 	__le32 *uuid = (__le32 *)c->uuid;
-	unsigned long long free_size_th = UFIFS_FREE_SIZE_SYNC_TH;	
 
 	free = ubifs_get_free_space(c);
 	dbg_gen("free space %lld bytes (%lld blocks)",
 		free, free >> UBIFS_BLOCK_SHIFT);
-	if(free <= free_size_th && c->ro_mount == 0){
-		ubifs_sync_fs(dentry->d_sb,1);
-		free = ubifs_get_free_space(c);
-		//printk("[ubifs_statfs]free space %lld B after sync\n",free);
-	}	
-	
+
 	buf->f_type = UBIFS_SUPER_MAGIC;
 	buf->f_bsize = UBIFS_BLOCK_SIZE;
 	buf->f_blocks = c->block_cnt;
@@ -422,9 +411,7 @@ static int ubifs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	else
 		buf->f_bavail = 0;
 	buf->f_files = 0;
-	spin_lock(&c->cnt_lock);
-	buf->f_ffree = INUM_WATERMARK - c->highest_inum;
-	spin_unlock(&c->cnt_lock);
+	buf->f_ffree = 0;
 	buf->f_namelen = UBIFS_MAX_NLEN;
 	buf->f_fsid.val[0] = le32_to_cpu(uuid[0]) ^ le32_to_cpu(uuid[2]);
 	buf->f_fsid.val[1] = le32_to_cpu(uuid[1]) ^ le32_to_cpu(uuid[3]);
@@ -437,19 +424,19 @@ static int ubifs_show_options(struct seq_file *s, struct dentry *root)
 	struct ubifs_info *c = root->d_sb->s_fs_info;
 
 	if (c->mount_opts.unmount_mode == 2)
-		seq_printf(s, ",fast_unmount");
+		seq_puts(s, ",fast_unmount");
 	else if (c->mount_opts.unmount_mode == 1)
-		seq_printf(s, ",norm_unmount");
+		seq_puts(s, ",norm_unmount");
 
 	if (c->mount_opts.bulk_read == 2)
-		seq_printf(s, ",bulk_read");
+		seq_puts(s, ",bulk_read");
 	else if (c->mount_opts.bulk_read == 1)
-		seq_printf(s, ",no_bulk_read");
+		seq_puts(s, ",no_bulk_read");
 
 	if (c->mount_opts.chk_data_crc == 2)
-		seq_printf(s, ",chk_data_crc");
+		seq_puts(s, ",chk_data_crc");
 	else if (c->mount_opts.chk_data_crc == 1)
-		seq_printf(s, ",no_chk_data_crc");
+		seq_puts(s, ",no_chk_data_crc");
 
 	if (c->mount_opts.override_compr) {
 		seq_printf(s, ",compr=%s",
@@ -809,8 +796,8 @@ static int alloc_wbufs(struct ubifs_info *c)
 {
 	int i, err;
 
-	c->jheads = kzalloc(c->jhead_cnt * sizeof(struct ubifs_jhead),
-			   GFP_KERNEL);
+	c->jheads = kcalloc(c->jhead_cnt, sizeof(struct ubifs_jhead),
+			    GFP_KERNEL);
 	if (!c->jheads)
 		return -ENOMEM;
 
@@ -876,7 +863,7 @@ static void free_orphans(struct ubifs_info *c)
 		ubifs_err("orphan list not empty at unmount");
 	}
 
-	kfree(c->orph_buf);
+	vfree(c->orph_buf);
 	c->orph_buf = NULL;
 }
 
@@ -886,26 +873,10 @@ static void free_orphans(struct ubifs_info *c)
  */
 static void free_buds(struct ubifs_info *c)
 {
-	struct rb_node *this = c->buds.rb_node;
-	struct ubifs_bud *bud;
+	struct ubifs_bud *bud, *n;
 
-	while (this) {
-		if (this->rb_left)
-			this = this->rb_left;
-		else if (this->rb_right)
-			this = this->rb_right;
-		else {
-			bud = rb_entry(this, struct ubifs_bud, rb);
-			this = rb_parent(this);
-			if (this) {
-				if (this->rb_left == &bud->rb)
-					this->rb_left = NULL;
-				else
-					this->rb_right = NULL;
-			}
-			kfree(bud);
-		}
-	}
+	rbtree_postorder_for_each_entry_safe(bud, n, &c->buds, rb)
+		kfree(bud);
 }
 
 /**
@@ -1178,6 +1149,9 @@ static int mount_ubifs(struct ubifs_info *c)
 	size_t sz;
 
 	c->ro_mount = !!(c->vfs_sb->s_flags & MS_RDONLY);
+	/* Suppress error messages while probing if MS_SILENT is set */
+	c->probing = !!(c->vfs_sb->s_flags & MS_SILENT);
+
 	err = init_constants_early(c);
 	if (err)
 		return err;
@@ -1217,12 +1191,12 @@ static int mount_ubifs(struct ubifs_info *c)
 	if (!c->bottom_up_buf)
 		goto out_free;
 
-	c->sbuf = kmalloc(c->leb_size, GFP_KERNEL);
+	c->sbuf = vmalloc(c->leb_size);
 	if (!c->sbuf)
 		goto out_free;
 
 	if (!c->ro_mount) {
-		c->ileb_buf = kmalloc(c->leb_size, GFP_KERNEL);
+		c->ileb_buf = vmalloc(c->leb_size);
 		if (!c->ileb_buf)
 			goto out_free;
 	}
@@ -1242,6 +1216,8 @@ static int mount_ubifs(struct ubifs_info *c)
 	err = ubifs_read_superblock(c);
 	if (err)
 		goto out_free;
+
+	c->probing = 0;
 
 	/*
 	 * Make sure the compressor which is set as default in the superblock
@@ -1512,8 +1488,8 @@ out_cbuf:
 out_free:
 	kfree(c->write_reserve_buf);
 	kfree(c->bu.buf);
-	kfree(c->ileb_buf);
-	kfree(c->sbuf);
+	vfree(c->ileb_buf);
+	vfree(c->sbuf);
 	kfree(c->bottom_up_buf);
 	ubifs_debugging_exit(c);
 	return err;
@@ -1551,8 +1527,8 @@ static void ubifs_umount(struct ubifs_info *c)
 	kfree(c->mst_node);
 	kfree(c->write_reserve_buf);
 	kfree(c->bu.buf);
-	kfree(c->ileb_buf);
-	kfree(c->sbuf);
+	vfree(c->ileb_buf);
+	vfree(c->sbuf);
 	kfree(c->bottom_up_buf);
 	ubifs_debugging_exit(c);
 }
@@ -1585,7 +1561,7 @@ static int ubifs_remount_rw(struct ubifs_info *c)
 	if (c->space_fixup) {
 		err = ubifs_fixup_free_space(c);
 		if (err)
-			return err;
+			goto out;
 	}
 
 	err = check_free_space(c);
@@ -1636,19 +1612,17 @@ static int ubifs_remount_rw(struct ubifs_info *c)
 			goto out;
 	}
 
-	if(c->ileb_buf == NULL) {
-		c->ileb_buf = kmalloc(c->leb_size, GFP_KERNEL);
-	}
+	c->ileb_buf = vmalloc(c->leb_size);
 	if (!c->ileb_buf) {
 		err = -ENOMEM;
 		goto out;
 	}
 
-	if(c->write_reserve_buf == NULL) {
-		c->write_reserve_buf = kmalloc(COMPRESSED_DATA_NODE_BUF_SZ, GFP_KERNEL);
-	}
-	if (!c->write_reserve_buf)
+	c->write_reserve_buf = kmalloc(COMPRESSED_DATA_NODE_BUF_SZ, GFP_KERNEL);
+	if (!c->write_reserve_buf) {
+		err = -ENOMEM;
 		goto out;
+	}
 
 	err = ubifs_lpt_init(c, 0, 1);
 	if (err)
@@ -1665,9 +1639,7 @@ static int ubifs_remount_rw(struct ubifs_info *c)
 	}
 	wake_up_process(c->bgt);
 
-	if(c->orph_buf == NULL) {
-		c->orph_buf = kmalloc(c->leb_size, GFP_KERNEL);
-	}
+	c->orph_buf = vmalloc(c->leb_size);
 	if (!c->orph_buf) {
 		err = -ENOMEM;
 		goto out;
@@ -1715,7 +1687,7 @@ static int ubifs_remount_rw(struct ubifs_info *c)
 
 out:
 	c->ro_mount = 1;
-	kfree(c->orph_buf);
+	vfree(c->orph_buf);
 	c->orph_buf = NULL;
 	if (c->bgt) {
 		kthread_stop(c->bgt);
@@ -1724,7 +1696,7 @@ out:
 	free_wbufs(c);
 	kfree(c->write_reserve_buf);
 	c->write_reserve_buf = NULL;
-	kfree(c->ileb_buf);
+	vfree(c->ileb_buf);
 	c->ileb_buf = NULL;
 	ubifs_lpt_free(c, 1);
 	c->remounting_rw = 0;
@@ -1754,8 +1726,11 @@ static void ubifs_remount_ro(struct ubifs_info *c)
 
 	dbg_save_space_info(c);
 
-	for (i = 0; i < c->jhead_cnt; i++)
-		ubifs_wbuf_sync(&c->jheads[i].wbuf);
+	for (i = 0; i < c->jhead_cnt; i++) {
+		err = ubifs_wbuf_sync(&c->jheads[i].wbuf);
+		if (err)
+			ubifs_ro_mode(c, err);
+	}
 
 	c->mst_node->flags &= ~cpu_to_le32(UBIFS_MST_DIRTY);
 	c->mst_node->flags |= cpu_to_le32(UBIFS_MST_NO_ORPHS);
@@ -1764,14 +1739,12 @@ static void ubifs_remount_ro(struct ubifs_info *c)
 	if (err)
 		ubifs_ro_mode(c, err);
 
-#if 0
-	kfree(c->orph_buf);
+	vfree(c->orph_buf);
 	c->orph_buf = NULL;
 	kfree(c->write_reserve_buf);
 	c->write_reserve_buf = NULL;
-	kfree(c->ileb_buf);
+	vfree(c->ileb_buf);
 	c->ileb_buf = NULL;
-#endif
 	ubifs_lpt_free(c, 1);
 	c->ro_mount = 1;
 	err = dbg_check_space_info(c);
@@ -1824,8 +1797,11 @@ static void ubifs_put_super(struct super_block *sb)
 			int err;
 
 			/* Synchronize write-buffers */
-			for (i = 0; i < c->jhead_cnt; i++)
-				ubifs_wbuf_sync(&c->jheads[i].wbuf);
+			for (i = 0; i < c->jhead_cnt; i++) {
+				err = ubifs_wbuf_sync(&c->jheads[i].wbuf);
+				if (err)
+					ubifs_ro_mode(c, err);
+			}
 
 			/*
 			 * We are being cleanly unmounted which means the
@@ -1862,6 +1838,7 @@ static int ubifs_remount_fs(struct super_block *sb, int *flags, char *data)
 	int err;
 	struct ubifs_info *c = sb->s_fs_info;
 
+	sync_filesystem(sb);
 	dbg_gen("old flags %#lx, new flags %#x", sb->s_flags, *flags);
 
 	err = ubifs_parse_options(c, data, 1);
@@ -1939,6 +1916,9 @@ static struct ubi_volume_desc *open_ubi(const char *name, int mode)
 	struct ubi_volume_desc *ubi;
 	int dev, vol;
 	char *endptr;
+
+	if (!name || !*name)
+		return ERR_PTR(-EINVAL);
 
 	/* First, try to open using the device node path method */
 	ubi = ubi_open_volume_path(name, mode);
@@ -2068,7 +2048,6 @@ static int ubifs_fill_super(struct super_block *sb, void *data, int silent)
 	if (c->max_inode_sz > MAX_LFS_FILESIZE)
 		sb->s_maxbytes = c->max_inode_sz = MAX_LFS_FILESIZE;
 	sb->s_op = &ubifs_super_operations;
-	sb->s_xattr = ubifs_xattr_handlers;
 
 	mutex_lock(&c->umount_mutex);
 	err = mount_ubifs(c);
@@ -2085,8 +2064,10 @@ static int ubifs_fill_super(struct super_block *sb, void *data, int silent)
 	}
 
 	sb->s_root = d_make_root(root);
-	if (!sb->s_root)
+	if (!sb->s_root) {
+		err = -ENOMEM;
 		goto out_umount;
+	}
 
 	mutex_unlock(&c->umount_mutex);
 	return 0;

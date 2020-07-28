@@ -17,13 +17,13 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <linux/cpu.h>
+#include <linux/cpu_pm.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/sched.h>
 #include <linux/signal.h>
 #include <linux/hardirq.h>
-#include <linux/cpu.h>
-
 
 #include <asm/fpsimd.h>
 #include <asm/cputype.h>
@@ -159,6 +159,7 @@ void fpsimd_flush_thread(void)
 {
 	preempt_disable();
 	memset(&current->thread.fpsimd_state, 0, sizeof(struct fpsimd_state));
+	fpsimd_flush_task_state(current);
 	set_thread_flag(TIF_FOREIGN_FPSTATE);
 	preempt_enable();
 }
@@ -290,7 +291,7 @@ static struct notifier_block fpsimd_cpu_pm_notifier_block = {
 	.notifier_call = fpsimd_cpu_pm_notifier,
 };
 
-static void fpsimd_pm_init(void)
+static void __init fpsimd_pm_init(void)
 {
 	cpu_pm_register_notifier(&fpsimd_cpu_pm_notifier_block);
 }
@@ -299,20 +300,33 @@ static void fpsimd_pm_init(void)
 static inline void fpsimd_pm_init(void) { }
 #endif /* CONFIG_CPU_PM */
 
-#ifdef CONFIG_MEDIATEK_SOLUTION
-static int fpsimd_hotplug(struct notifier_block *b, unsigned long action, void *hcpu)
+#ifdef CONFIG_HOTPLUG_CPU
+static int fpsimd_cpu_hotplug_notifier(struct notifier_block *nfb,
+				       unsigned long action,
+				       void *hcpu)
 {
-	if (action == CPU_DYING || action == CPU_DYING_FROZEN) {
-		if (current->mm && !test_thread_flag(TIF_FOREIGN_FPSTATE))
-			fpsimd_save_state(&current->thread.fpsimd_state);
-		this_cpu_write(fpsimd_last_state, NULL);
-	} else if (action == CPU_STARTING || action == CPU_STARTING_FROZEN){
-		if (current->mm)
-			set_thread_flag(TIF_FOREIGN_FPSTATE);
+	unsigned int cpu = (long)hcpu;
+
+	switch (action) {
+	case CPU_DEAD:
+	case CPU_DEAD_FROZEN:
+		per_cpu(fpsimd_last_state, cpu) = NULL;
+		break;
 	}
-		
 	return NOTIFY_OK;
 }
+
+static struct notifier_block fpsimd_cpu_hotplug_notifier_block = {
+	.notifier_call = fpsimd_cpu_hotplug_notifier,
+};
+
+static inline void fpsimd_hotplug_init(void)
+{
+	register_cpu_notifier(&fpsimd_cpu_hotplug_notifier_block);
+}
+
+#else
+static inline void fpsimd_hotplug_init(void) { }
 #endif
 
 /*
@@ -320,22 +334,15 @@ static int fpsimd_hotplug(struct notifier_block *b, unsigned long action, void *
  */
 static int __init fpsimd_init(void)
 {
-	u64 pfr = read_cpuid(ID_AA64PFR0_EL1);
-
-	if (pfr & (0xf << 16)) {
+	if (elf_hwcap & HWCAP_FP) {
+		fpsimd_pm_init();
+		fpsimd_hotplug_init();
+	} else {
 		pr_notice("Floating-point is not implemented\n");
-		return 0;
 	}
-	elf_hwcap |= HWCAP_FP;
 
-	if (pfr & (0xf << 20))
+	if (!(elf_hwcap & HWCAP_ASIMD))
 		pr_notice("Advanced SIMD is not implemented\n");
-	else
-		elf_hwcap |= HWCAP_ASIMD;
-
-#ifdef CONFIG_MEDIATEK_SOLUTION
-	hotcpu_notifier(fpsimd_hotplug, 0);
-#endif
 
 	return 0;
 }

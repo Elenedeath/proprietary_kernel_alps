@@ -7,6 +7,8 @@
  * 30 May 2002:	Cleanup, Robert M. Love <rml@tech9.net>
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/mm.h>
@@ -22,7 +24,6 @@
  */
 
 const kernel_cap_t __cap_empty_set = CAP_EMPTY_SET;
-
 EXPORT_SYMBOL(__cap_empty_set);
 
 int file_caps_enabled = 1;
@@ -42,15 +43,10 @@ __setup("no_file_caps", file_caps_disable);
 
 static void warn_legacy_capability_use(void)
 {
-	static int warned;
-	if (!warned) {
-		char name[sizeof(current->comm)];
+	char name[sizeof(current->comm)];
 
-		printk(KERN_INFO "warning: `%s' uses 32-bit capabilities"
-		       " (legacy support in use)\n",
-		       get_task_comm(name, current));
-		warned = 1;
-	}
+	pr_info_once("warning: `%s' uses 32-bit capabilities (legacy support in use)\n",
+		     get_task_comm(name, current));
 }
 
 /*
@@ -71,16 +67,10 @@ static void warn_legacy_capability_use(void)
 
 static void warn_deprecated_v2(void)
 {
-	static int warned;
+	char name[sizeof(current->comm)];
 
-	if (!warned) {
-		char name[sizeof(current->comm)];
-
-		printk(KERN_INFO "warning: `%s' uses deprecated v2"
-		       " capabilities in a way that may be insecure.\n",
-		       get_task_comm(name, current));
-		warned = 1;
-	}
+	pr_info_once("warning: `%s' uses deprecated v2 capabilities in a way that may be insecure\n",
+		     get_task_comm(name, current));
 }
 
 /*
@@ -198,7 +188,7 @@ SYSCALL_DEFINE2(capget, cap_user_header_t, header, cap_user_data_t, dataptr)
 		 *
 		 * An alternative would be to return an error here
 		 * (-ERANGE), but that causes legacy applications to
-		 * unexpectidly fail; the capget/modify/capset aborts
+		 * unexpectedly fail; the capget/modify/capset aborts
 		 * before modification is attempted and the application
 		 * fails.
 		 */
@@ -281,7 +271,7 @@ SYSCALL_DEFINE2(capset, cap_user_header_t, header, const cap_user_data_t, data)
 	if (ret < 0)
 		goto error;
 
-	audit_log_capset(pid, new, current_cred());
+	audit_log_capset(new, current_cred());
 
 	return commit_creds(new);
 
@@ -369,6 +359,7 @@ bool has_capability_noaudit(struct task_struct *t, int cap)
 {
 	return has_ns_capability_noaudit(t, &init_user_ns, cap);
 }
+EXPORT_SYMBOL_GPL(has_capability_noaudit);
 
 /**
  * ns_capable - Determine if the current task has a superior capability in effect
@@ -384,7 +375,7 @@ bool has_capability_noaudit(struct task_struct *t, int cap)
 bool ns_capable(struct user_namespace *ns, int cap)
 {
 	if (unlikely(!cap_valid(cap))) {
-		printk(KERN_CRIT "capable() called with invalid cap=%u\n", cap);
+		pr_crit("capable() called with invalid cap=%u\n", cap);
 		BUG();
 	}
 
@@ -408,7 +399,8 @@ EXPORT_SYMBOL(ns_capable);
  * This does not set PF_SUPERPRIV because the caller may not
  * actually be privileged.
  */
-bool file_ns_capable(const struct file *file, struct user_namespace *ns, int cap)
+bool file_ns_capable(const struct file *file, struct user_namespace *ns,
+		     int cap)
 {
 	if (WARN_ON_ONCE(!cap_valid(cap)))
 		return false;
@@ -437,18 +429,6 @@ bool capable(int cap)
 EXPORT_SYMBOL(capable);
 
 /**
- * nsown_capable - Check superior capability to one's own user_ns
- * @cap: The capability in question
- *
- * Return true if the current task has the given superior capability
- * targeted at its own user namespace.
- */
-bool nsown_capable(int cap)
-{
-	return ns_capable(current_user_ns(), cap);
-}
-
-/**
  * capable_wrt_inode_uidgid - Check nsown_capable and uid and gid mapped
  * @inode: The inode in question
  * @cap: The capability in question
@@ -463,4 +443,25 @@ bool capable_wrt_inode_uidgid(const struct inode *inode, int cap)
 
 	return ns_capable(ns, cap) && kuid_has_mapping(ns, inode->i_uid) &&
 		kgid_has_mapping(ns, inode->i_gid);
+}
+EXPORT_SYMBOL(capable_wrt_inode_uidgid);
+
+/**
+ * ptracer_capable - Determine if the ptracer holds CAP_SYS_PTRACE in the namespace
+ * @tsk: The task that may be ptraced
+ * @ns: The user namespace to search for CAP_SYS_PTRACE in
+ *
+ * Return true if the task that is ptracing the current task had CAP_SYS_PTRACE
+ * in the specified user namespace.
+ */
+bool ptracer_capable(struct task_struct *tsk, struct user_namespace *ns)
+{
+	int ret = 0;  /* An absent tracer adds no restrictions */
+	const struct cred *cred;
+	rcu_read_lock();
+	cred = rcu_dereference(tsk->ptracer_cred);
+	if (cred)
+		ret = security_capable_noaudit(cred, ns, CAP_SYS_PTRACE);
+	rcu_read_unlock();
+	return (ret == 0);
 }

@@ -290,6 +290,7 @@ static int add_del_listener(pid_t pid, const struct cpumask *mask, int isadd)
 	struct listener_list *listeners;
 	struct listener *s, *tmp, *s2;
 	unsigned int cpu;
+	int ret = 0;
 
 	if (!cpumask_subset(mask, cpu_possible_mask))
 		return -EINVAL;
@@ -304,9 +305,10 @@ static int add_del_listener(pid_t pid, const struct cpumask *mask, int isadd)
 		for_each_cpu(cpu, mask) {
 			s = kmalloc_node(sizeof(struct listener),
 					GFP_KERNEL, cpu_to_node(cpu));
-			if (!s)
+			if (!s) {
+				ret = -ENOMEM;
 				goto cleanup;
-
+			}
 			s->pid = pid;
 			s->valid = 1;
 
@@ -339,7 +341,7 @@ cleanup:
 		}
 		up_write(&listeners->sem);
 	}
-	return 0;
+	return ret;
 }
 
 static int parse(struct nlattr *na, struct cpumask *mask)
@@ -404,11 +406,15 @@ static struct taskstats *mk_reply(struct sk_buff *skb, int type, u32 pid)
 	if (!na)
 		goto err;
 
-	if (nla_put(skb, type, sizeof(pid), &pid) < 0)
+	if (nla_put(skb, type, sizeof(pid), &pid) < 0) {
+		nla_nest_cancel(skb, na);
 		goto err;
+	}
 	ret = nla_reserve(skb, TASKSTATS_TYPE_STATS, sizeof(struct taskstats));
-	if (!ret)
+	if (!ret) {
+		nla_nest_cancel(skb, na);
 		goto err;
+	}
 	nla_nest_end(skb, na);
 
 	return nla_data(ret);
@@ -585,25 +591,33 @@ static int taskstats_user_cmd(struct sk_buff *skb, struct genl_info *info)
 static struct taskstats *taskstats_tgid_alloc(struct task_struct *tsk)
 {
 	struct signal_struct *sig = tsk->signal;
-	struct taskstats *stats;
+	struct taskstats *stats_new, *stats;
 
-	if (sig->stats || thread_group_empty(tsk))
-		goto ret;
+	/* Pairs with smp_store_release() below. */
+	stats = smp_load_acquire(&sig->stats);
+	if (stats || thread_group_empty(tsk))
+		return stats;
 
 	/* No problem if kmem_cache_zalloc() fails */
-	stats = kmem_cache_zalloc(taskstats_cache, GFP_KERNEL);
+	stats_new = kmem_cache_zalloc(taskstats_cache, GFP_KERNEL);
 
 	spin_lock_irq(&tsk->sighand->siglock);
-	if (!sig->stats) {
-		sig->stats = stats;
-		stats = NULL;
+	stats = sig->stats;
+	if (!stats) {
+		/*
+		 * Pairs with smp_store_release() above and order the
+		 * kmem_cache_zalloc().
+		 */
+		smp_store_release(&sig->stats, stats_new);
+		stats = stats_new;
+		stats_new = NULL;
 	}
 	spin_unlock_irq(&tsk->sighand->siglock);
 
-	if (stats)
-		kmem_cache_free(taskstats_cache, stats);
-ret:
-	return sig->stats;
+	if (stats_new)
+		kmem_cache_free(taskstats_cache, stats_new);
+
+	return stats;
 }
 
 /* Send pid data out on exit */
@@ -632,7 +646,7 @@ void taskstats_exit(struct task_struct *tsk, int group_dead)
 		fill_tgid_exit(tsk);
 	}
 
-	listeners = __this_cpu_ptr(&listener_array);
+	listeners = raw_cpu_ptr(&listener_array);
 	if (list_empty(&listeners->list))
 		return;
 
@@ -667,17 +681,18 @@ err:
 	nlmsg_free(rep_skb);
 }
 
-static struct genl_ops taskstats_ops = {
-	.cmd		= TASKSTATS_CMD_GET,
-	.doit		= taskstats_user_cmd,
-	.policy		= taskstats_cmd_get_policy,
-	.flags		= GENL_ADMIN_PERM,
-};
-
-static struct genl_ops cgroupstats_ops = {
-	.cmd		= CGROUPSTATS_CMD_GET,
-	.doit		= cgroupstats_user_cmd,
-	.policy		= cgroupstats_cmd_get_policy,
+static const struct genl_ops taskstats_ops[] = {
+	{
+		.cmd		= TASKSTATS_CMD_GET,
+		.doit		= taskstats_user_cmd,
+		.policy		= taskstats_cmd_get_policy,
+		.flags		= GENL_ADMIN_PERM,
+	},
+	{
+		.cmd		= CGROUPSTATS_CMD_GET,
+		.doit		= cgroupstats_user_cmd,
+		.policy		= cgroupstats_cmd_get_policy,
+	},
 };
 
 /* Needed early in initialization */
@@ -696,26 +711,13 @@ static int __init taskstats_init(void)
 {
 	int rc;
 
-	rc = genl_register_family(&family);
+	rc = genl_register_family_with_ops(&family, taskstats_ops);
 	if (rc)
 		return rc;
-
-	rc = genl_register_ops(&family, &taskstats_ops);
-	if (rc < 0)
-		goto err;
-
-	rc = genl_register_ops(&family, &cgroupstats_ops);
-	if (rc < 0)
-		goto err_cgroup_ops;
 
 	family_registered = 1;
 	pr_info("registered taskstats version %d\n", TASKSTATS_GENL_VERSION);
 	return 0;
-err_cgroup_ops:
-	genl_unregister_ops(&family, &taskstats_ops);
-err:
-	genl_unregister_family(&family);
-	return rc;
 }
 
 /*

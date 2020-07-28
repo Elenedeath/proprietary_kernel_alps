@@ -15,7 +15,6 @@
 
 #include <linux/module.h>
 #include <linux/types.h>
-#include <linux/init.h>
 #include <linux/device.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/map.h>
@@ -29,7 +28,6 @@
 struct of_flash_list {
 	struct mtd_info *mtd;
 	struct map_info map;
-	struct resource *res;
 };
 
 struct of_flash {
@@ -56,18 +54,10 @@ static int of_flash_remove(struct platform_device *dev)
 	if (info->cmtd)
 		mtd_device_unregister(info->cmtd);
 
-	for (i = 0; i < info->list_size; i++) {
+	for (i = 0; i < info->list_size; i++)
 		if (info->list[i].mtd)
 			map_destroy(info->list[i].mtd);
 
-		if (info->list[i].map.virt)
-			iounmap(info->list[i].map.virt);
-
-		if (info->list[i].res) {
-			release_resource(info->list[i].res);
-			kfree(info->list[i].res);
-		}
-	}
 	return 0;
 }
 
@@ -104,7 +94,7 @@ static struct mtd_info *obsolete_probe(struct platform_device *dev,
 		if (strcmp(of_probe, "ROM") != 0)
 			dev_warn(&dev->dev, "obsolete_probe: don't know probe "
 				 "type '%s', mapping as rom\n", of_probe);
-		return do_map_probe("mtd_rom", map);
+		return do_map_probe("map_rom", map);
 	}
 }
 
@@ -224,10 +214,11 @@ static int of_flash_probe(struct platform_device *dev)
 
 		err = -EBUSY;
 		res_size = resource_size(&res);
-		info->list[i].res = request_mem_region(res.start, res_size,
-						       dev_name(&dev->dev));
-		if (!info->list[i].res)
+		info->list[i].map.virt = devm_ioremap_resource(&dev->dev, &res);
+		if (IS_ERR(info->list[i].map.virt)) {
+			err = PTR_ERR(info->list[i].map.virt);
 			goto err_out;
+		}
 
 		err = -ENXIO;
 		width = of_get_property(dp, "bank-width", NULL);
@@ -242,15 +233,6 @@ static int of_flash_probe(struct platform_device *dev)
 		info->list[i].map.size = res_size;
 		info->list[i].map.bankwidth = be32_to_cpup(width);
 		info->list[i].map.device_node = dp;
-
-		err = -ENOMEM;
-		info->list[i].map.virt = ioremap(info->list[i].map.phys,
-						 info->list[i].map.size);
-		if (!info->list[i].map.virt) {
-			dev_err(&dev->dev, "Failed to ioremap() flash"
-				" region\n");
-			goto err_out;
-		}
 
 		simple_map_init(&info->list[i].map);
 
@@ -339,6 +321,10 @@ static struct of_device_id of_flash_match[] = {
 	{
 		.compatible     = "mtd-ram",
 		.data           = (void *)"map_ram",
+	},
+	{
+		.compatible     = "mtd-rom",
+		.data           = (void *)"map_rom",
 	},
 	{
 		.type		= "rom",

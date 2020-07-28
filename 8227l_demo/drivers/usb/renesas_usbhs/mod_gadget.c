@@ -77,9 +77,9 @@ struct usbhsg_recip_handle {
 		struct usbhsg_gpriv, mod)
 
 #define __usbhsg_for_each_uep(start, pos, g, i)	\
-	for (i = start, pos = (g)->uep + i;	\
-	     i < (g)->uep_size;			\
-	     i++, pos = (g)->uep + i)
+	for ((i) = start;					\
+	     ((i) < (g)->uep_size) && ((pos) = (g)->uep + (i));	\
+	     (i)++)
 
 #define usbhsg_for_each_uep(pos, gpriv, i)	\
 	__usbhsg_for_each_uep(1, pos, gpriv, i)
@@ -118,18 +118,34 @@ struct usbhsg_recip_handle {
 /*
  *		queue push/pop
  */
+static void __usbhsg_queue_pop(struct usbhsg_uep *uep,
+			       struct usbhsg_request *ureq,
+			       int status)
+{
+	struct usbhsg_gpriv *gpriv = usbhsg_uep_to_gpriv(uep);
+	struct usbhs_pipe *pipe = usbhsg_uep_to_pipe(uep);
+	struct device *dev = usbhsg_gpriv_to_dev(gpriv);
+	struct usbhs_priv *priv = usbhsg_gpriv_to_priv(gpriv);
+
+	dev_dbg(dev, "pipe %d : queue pop\n", usbhs_pipe_number(pipe));
+
+	ureq->req.status = status;
+	spin_unlock(usbhs_priv_to_lock(priv));
+	usb_gadget_giveback_request(&uep->ep, &ureq->req);
+	spin_lock(usbhs_priv_to_lock(priv));
+}
+
 static void usbhsg_queue_pop(struct usbhsg_uep *uep,
 			     struct usbhsg_request *ureq,
 			     int status)
 {
 	struct usbhsg_gpriv *gpriv = usbhsg_uep_to_gpriv(uep);
-	struct usbhs_pipe *pipe = usbhsg_uep_to_pipe(uep);
-	struct device *dev = usbhsg_gpriv_to_dev(gpriv);
+	struct usbhs_priv *priv = usbhsg_gpriv_to_priv(gpriv);
+	unsigned long flags;
 
-	dev_dbg(dev, "pipe %d : queue pop\n", usbhs_pipe_number(pipe));
-
-	ureq->req.status = status;
-	ureq->req.complete(&uep->ep, &ureq->req);
+	usbhs_lock(priv, flags);
+	__usbhsg_queue_pop(uep, ureq, status);
+	usbhs_unlock(priv, flags);
 }
 
 static void usbhsg_queue_done(struct usbhs_priv *priv, struct usbhs_pkt *pkt)
@@ -137,10 +153,14 @@ static void usbhsg_queue_done(struct usbhs_priv *priv, struct usbhs_pkt *pkt)
 	struct usbhs_pipe *pipe = pkt->pipe;
 	struct usbhsg_uep *uep = usbhsg_pipe_to_uep(pipe);
 	struct usbhsg_request *ureq = usbhsg_pkt_to_ureq(pkt);
+	unsigned long flags;
 
 	ureq->req.actual = pkt->actual;
 
-	usbhsg_queue_pop(uep, ureq, 0);
+	usbhs_lock(priv, flags);
+	if (uep)
+		__usbhsg_queue_pop(uep, ureq, 0);
+	usbhs_unlock(priv, flags);
 }
 
 static void usbhsg_queue_push(struct usbhsg_uep *uep,
@@ -441,12 +461,18 @@ static int usbhsg_irq_dev_state(struct usbhs_priv *priv,
 {
 	struct usbhsg_gpriv *gpriv = usbhsg_priv_to_gpriv(priv);
 	struct device *dev = usbhsg_gpriv_to_dev(gpriv);
+	int state = usbhs_status_get_device_state(irq_state);
 
 	gpriv->gadget.speed = usbhs_bus_get_speed(priv);
 
-	dev_dbg(dev, "state = %x : speed : %d\n",
-		usbhs_status_get_device_state(irq_state),
-		gpriv->gadget.speed);
+	dev_dbg(dev, "state = %x : speed : %d\n", state, gpriv->gadget.speed);
+
+	if (gpriv->gadget.speed != USB_SPEED_UNKNOWN &&
+	    (state & SUSPENDED_STATE)) {
+		if (gpriv->driver && gpriv->driver->suspend)
+			gpriv->driver->suspend(&gpriv->gadget);
+		usb_gadget_set_state(&gpriv->gadget, USB_STATE_SUSPENDED);
+	}
 
 	return 0;
 }
@@ -607,8 +633,13 @@ usbhsg_ep_enable_end:
 static int usbhsg_ep_disable(struct usb_ep *ep)
 {
 	struct usbhsg_uep *uep = usbhsg_ep_to_uep(ep);
+	struct usbhs_pipe *pipe = usbhsg_uep_to_pipe(uep);
+
+	if (!pipe)
+		return -EINVAL;
 
 	usbhsg_pipe_disable(uep);
+	usbhs_pipe_free(pipe);
 
 	uep->pipe->mod_private	= NULL;
 	uep->pipe		= NULL;
@@ -678,14 +709,25 @@ static int __usbhsg_ep_set_halt_wedge(struct usb_ep *ep, int halt, int wedge)
 	struct usbhs_priv *priv = usbhsg_gpriv_to_priv(gpriv);
 	struct device *dev = usbhsg_gpriv_to_dev(gpriv);
 	unsigned long flags;
-
-	usbhsg_pipe_disable(uep);
+	int ret = 0;
 
 	dev_dbg(dev, "set halt %d (pipe %d)\n",
 		halt, usbhs_pipe_number(pipe));
 
 	/********************  spin lock ********************/
 	usbhs_lock(priv, flags);
+
+	/*
+	 * According to usb_ep_set_halt()'s description, this function should
+	 * return -EAGAIN if the IN endpoint has any queue or data. Note
+	 * that the usbhs_pipe_is_dir_in() returns false if the pipe is an
+	 * IN endpoint in the gadget mode.
+	 */
+	if (!usbhs_pipe_is_dir_in(pipe) && (__usbhsf_pkt_get(pipe) ||
+	    usbhs_pipe_contains_transmittable_data(pipe))) {
+		ret = -EAGAIN;
+		goto out;
+	}
 
 	if (halt)
 		usbhs_pipe_stall(pipe);
@@ -697,10 +739,11 @@ static int __usbhsg_ep_set_halt_wedge(struct usb_ep *ep, int halt, int wedge)
 	else
 		usbhsg_status_clr(gpriv, USBHSG_STATUS_WEDGE);
 
+out:
 	usbhs_unlock(priv, flags);
 	/********************  spin unlock ******************/
 
-	return 0;
+	return ret;
 }
 
 static int usbhsg_ep_set_halt(struct usb_ep *ep, int value)
@@ -862,10 +905,6 @@ static int usbhsg_gadget_stop(struct usb_gadget *gadget,
 	struct usbhsg_gpriv *gpriv = usbhsg_gadget_to_gpriv(gadget);
 	struct usbhs_priv *priv = usbhsg_gpriv_to_priv(gpriv);
 
-	if (!driver		||
-	    !driver->unbind)
-		return -EINVAL;
-
 	usbhsg_try_stop(priv, USBHSG_STATUS_REGISTERD);
 	gpriv->driver = NULL;
 
@@ -998,11 +1037,11 @@ int usbhs_mod_gadget_probe(struct usbhs_priv *priv)
 		/* init DCP */
 		if (usbhsg_is_dcp(uep)) {
 			gpriv->gadget.ep0 = &uep->ep;
-			uep->ep.maxpacket = 64;
+			usb_ep_set_maxpacket_limit(&uep->ep, 64);
 		}
 		/* init normal pipe */
 		else {
-			uep->ep.maxpacket = 512;
+			usb_ep_set_maxpacket_limit(&uep->ep, 512);
 			list_add_tail(&uep->ep.ep_list, &gpriv->gadget.ep_list);
 		}
 	}

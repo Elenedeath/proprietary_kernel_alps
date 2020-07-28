@@ -78,7 +78,8 @@ void hdpvr_delete(struct hdpvr_device *dev)
 
 static void challenge(u8 *bytes)
 {
-	u64 *i64P, tmp64;
+	__le64 *i64P;
+	u64 tmp64;
 	uint i, idx;
 
 	for (idx = 0; idx < 32; ++idx) {
@@ -106,10 +107,10 @@ static void challenge(u8 *bytes)
 			for (i = 0; i < 3; i++)
 				bytes[1] *= bytes[6] + 1;
 			for (i = 0; i < 3; i++) {
-				i64P = (u64 *)bytes;
+				i64P = (__le64 *)bytes;
 				tmp64 = le64_to_cpup(i64P);
-				tmp64 <<= bytes[7] & 0x0f;
-				*i64P += cpu_to_le64(tmp64);
+				tmp64 = tmp64 + (tmp64 << (bytes[7] & 0x0f));
+				*i64P = cpu_to_le64(tmp64);
 			}
 			break;
 		}
@@ -123,14 +124,6 @@ static int device_authorization(struct hdpvr_device *dev)
 	int ret, retval = -ENOMEM;
 	char request_type = 0x38, rcv_request = 0x81;
 	char *response;
-#ifdef HDPVR_DEBUG
-	size_t buf_size = 46;
-	char *print_buf = kzalloc(5*buf_size+1, GFP_KERNEL);
-	if (!print_buf) {
-		v4l2_err(&dev->v4l2_dev, "Out of memory\n");
-		return retval;
-	}
-#endif
 
 	mutex_lock(&dev->usbc_mutex);
 	ret = usb_control_msg(dev->udev,
@@ -146,16 +139,15 @@ static int device_authorization(struct hdpvr_device *dev)
 	}
 #ifdef HDPVR_DEBUG
 	else {
-		hex_dump_to_buffer(dev->usbc_buf, 46, 16, 1, print_buf,
-				   5*buf_size+1, 0);
 		v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev,
-			 "Status request returned, len %d: %s\n",
-			 ret, print_buf);
+			 "Status request returned, len %d: %46ph\n",
+			 ret, dev->usbc_buf);
 	}
 #endif
 
 	dev->fw_ver = dev->usbc_buf[1];
 
+	dev->usbc_buf[46] = '\0';
 	v4l2_info(&dev->v4l2_dev, "firmware version 0x%x dated %s\n",
 			  dev->fw_ver, &dev->usbc_buf[2]);
 
@@ -188,16 +180,13 @@ static int device_authorization(struct hdpvr_device *dev)
 
 	response = dev->usbc_buf+38;
 #ifdef HDPVR_DEBUG
-	hex_dump_to_buffer(response, 8, 16, 1, print_buf, 5*buf_size+1, 0);
-	v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev, "challenge: %s\n",
-		 print_buf);
+	v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev, "challenge: %8ph\n",
+		 response);
 #endif
 	challenge(response);
 #ifdef HDPVR_DEBUG
-	hex_dump_to_buffer(response, 8, 16, 1, print_buf, 5*buf_size+1, 0);
-	v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev, " response: %s\n",
-		 print_buf);
-	kfree(print_buf);
+	v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev, " response: %8ph\n",
+		 response);
 #endif
 
 	msleep(100);
@@ -220,7 +209,6 @@ static int hdpvr_device_init(struct hdpvr_device *dev)
 {
 	int ret;
 	u8 *buf;
-	struct hdpvr_video_info *vidinf;
 
 	if (device_authorization(dev))
 		return -EACCES;
@@ -241,13 +229,6 @@ static int hdpvr_device_init(struct hdpvr_device *dev)
 	v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev,
 		 "control request returned %d\n", ret);
 	mutex_unlock(&dev->usbc_mutex);
-
-	vidinf = get_video_info(dev);
-	if (!vidinf)
-		v4l2_dbg(MSG_INFO, hdpvr_debug, &dev->v4l2_dev,
-			"no valid video signal or device init failed\n");
-	else
-		kfree(vidinf);
 
 	/* enable fan and bling leds */
 	mutex_lock(&dev->usbc_mutex);
@@ -300,6 +281,7 @@ static int hdpvr_probe(struct usb_interface *interface,
 	struct i2c_client *client;
 	size_t buffer_size;
 	int i;
+	int dev_num;
 	int retval = -ENOMEM;
 
 	/* allocate memory for our device state and initialize it */
@@ -308,8 +290,6 @@ static int hdpvr_probe(struct usb_interface *interface,
 		dev_err(&interface->dev, "Out of memory\n");
 		goto error;
 	}
-
-	dev->workqueue = 0;
 
 	/* init video transfer queues first of all */
 	/* to prevent oops in hdpvr_delete() on error paths */
@@ -410,8 +390,17 @@ static int hdpvr_probe(struct usb_interface *interface,
 	}
 #endif
 
+	dev_num = atomic_inc_return(&dev_nr);
+	if (dev_num >= HDPVR_MAX) {
+		v4l2_err(&dev->v4l2_dev,
+			 "max device number reached, device register failed\n");
+		atomic_dec(&dev_nr);
+		retval = -ENODEV;
+		goto reg_fail;
+	}
+
 	retval = hdpvr_register_videodev(dev, &interface->dev,
-				    video_nr[atomic_inc_return(&dev_nr)]);
+				    video_nr[dev_num]);
 	if (retval < 0) {
 		v4l2_err(&dev->v4l2_dev, "registering videodev failed\n");
 		goto reg_fail;

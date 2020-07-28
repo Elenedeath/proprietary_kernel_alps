@@ -272,7 +272,7 @@ long long ubifs_calc_available(const struct ubifs_info *c, int min_idx_lebs)
  */
 static int can_use_rp(struct ubifs_info *c)
 {
-	if (uid_lte(current_fsuid(), c->rp_uid) || capable(CAP_SYS_RESOURCE) ||
+	if (uid_eq(current_fsuid(), c->rp_uid) || capable(CAP_SYS_RESOURCE) ||
 	    (!gid_eq(c->rp_gid, GLOBAL_ROOT_GID) && in_group_p(c->rp_gid)))
 		return 1;
 	return 0;
@@ -437,7 +437,6 @@ static int calc_dd_growth(const struct ubifs_info *c,
  */
 int ubifs_budget_space(struct ubifs_info *c, struct ubifs_budget_req *req)
 {
-	int uninitialized_var(cmt_retries), uninitialized_var(wb_retries);
 	int err, idx_growth, data_growth, dd_growth, retried = 0;
 
 	ubifs_assert(req->new_page <= 1);
@@ -564,10 +563,6 @@ void ubifs_release_budget(struct ubifs_info *c, struct ubifs_budget_req *req)
 
 	ubifs_assert(c->bi.idx_growth >= 0);
 	ubifs_assert(c->bi.data_growth >= 0);
-	if(c->bi.dd_growth < 0) {
-		ubifs_err("c->bi.dd_growth %lld\n", c->bi.dd_growth);
-		c->bi.dd_growth = 0;
-	}
 	ubifs_assert(c->bi.dd_growth >= 0);
 	ubifs_assert(c->bi.min_idx_lebs < c->main_lebs);
 	ubifs_assert(!(c->bi.idx_growth & 7));

@@ -27,8 +27,8 @@ static char *text;
 static int text_size, text_asize;
 
 struct buffer {
-        struct buffer *parent;
-        YY_BUFFER_STATE state;
+	struct buffer *parent;
+	YY_BUFFER_STATE state;
 };
 
 struct buffer *current_buf;
@@ -68,7 +68,6 @@ static void alloc_string(const char *str, int size)
 }
 %}
 
-ws	[ \n\t]
 n	[A-Za-z0-9_]
 
 %%
@@ -181,6 +180,8 @@ n	[A-Za-z0-9_]
 	}
 	<<EOF>>	{
 		BEGIN(INITIAL);
+		yylval.string = text;
+		return T_WORD_QUOTE;
 	}
 }
 

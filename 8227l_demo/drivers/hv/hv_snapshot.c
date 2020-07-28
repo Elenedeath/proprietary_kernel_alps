@@ -24,6 +24,12 @@
 #include <linux/workqueue.h>
 #include <linux/hyperv.h>
 
+#include "hyperv_vmbus.h"
+
+#define VSS_MAJOR  5
+#define VSS_MINOR  0
+#define VSS_VERSION    (VSS_MAJOR << 16 | VSS_MINOR)
+
 
 
 /*
@@ -94,7 +100,7 @@ static void vss_send_op(struct work_struct *dummy)
 	vss_msg->vss_hdr.operation = op;
 	msg->len = sizeof(struct hv_vss_msg);
 
-	cn_netlink_send(msg, 0, GFP_ATOMIC);
+	cn_netlink_send(msg, 0, 0, GFP_ATOMIC);
 	kfree(msg);
 
 	return;
@@ -186,18 +192,8 @@ void hv_vss_onchannelcallback(void *context)
 
 		if (icmsghdrp->icmsgtype == ICMSGTYPE_NEGOTIATE) {
 			vmbus_prep_negotiate_resp(icmsghdrp, negop,
-				 recv_buffer, MAX_SRV_VER, MAX_SRV_VER);
-			/*
-			 * We currently negotiate the highest number the
-			 * host has presented. If this version is not
-			 * atleast 5.0, reject.
-			 */
-			negop = (struct icmsg_negotiate *)&recv_buffer[
-				sizeof(struct vmbuspipe_hdr) +
-				sizeof(struct icmsg_hdr)];
-
-			if (negop->icversion_data[1].major < 5)
-				negop->icframe_vercnt = 0;
+				 recv_buffer, UTIL_FW_VERSION,
+				 VSS_VERSION);
 		} else {
 			vss_msg = (struct hv_vss_msg *)&recv_buffer[
 				sizeof(struct vmbuspipe_hdr) +
@@ -264,6 +260,12 @@ int
 hv_vss_init(struct hv_util_service *srv)
 {
 	int err;
+
+	if (vmbus_proto_version < VERSION_WIN8_1) {
+		pr_warn("Integration service 'Backup (volume snapshot)'"
+			" not supported on this host version.\n");
+		return -ENOTSUPP;
+	}
 
 	err = cn_add_callback(&vss_id, vss_name, vss_cn_callback);
 	if (err)

@@ -31,6 +31,7 @@
 
 #include <asm/fpsimd.h>
 #include <asm/hw_breakpoint.h>
+#include <asm/pgtable-hwdef.h>
 #include <asm/ptrace.h>
 #include <asm/types.h>
 
@@ -79,6 +80,7 @@ struct thread_struct {
 	unsigned long		tp_value;
 	struct fpsimd_state	fpsimd_state;
 	unsigned long		fault_address;	/* fault info */
+	unsigned long		fault_code;	/* ESR_EL1 value */
 	struct debug_info	debug;		/* debugging */
 };
 
@@ -107,6 +109,11 @@ static inline void compat_start_thread(struct pt_regs *regs, unsigned long pc,
 	regs->pstate = COMPAT_PSR_MODE_USR;
 	if (pc & 1)
 		regs->pstate |= COMPAT_PSR_T_BIT;
+
+#ifdef __AARCH64EB__
+	regs->pstate |= COMPAT_PSR_E_BIT;
+#endif
+
 	regs->compat_sp = sp;
 }
 #endif
@@ -123,6 +130,7 @@ extern void release_thread(struct task_struct *);
 unsigned long get_wchan(struct task_struct *p);
 
 #define cpu_relax()			barrier()
+#define cpu_relax_lowlatency()                cpu_relax()
 
 /* Thread switching */
 extern struct task_struct *cpu_switch_to(struct task_struct *prev,
@@ -158,5 +166,8 @@ static inline void spin_lock_prefetch(const void *x)
 #define HAVE_ARCH_PICK_MMAP_LAYOUT
 
 #endif
+
+int cpu_enable_pan(void *__unused);
+int cpu_enable_uao(void *__unused);
 
 #endif /* __ASM_PROCESSOR_H */

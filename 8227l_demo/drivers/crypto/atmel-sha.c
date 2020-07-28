@@ -30,6 +30,7 @@
 #include <linux/irq.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-mapping.h>
+#include <linux/of_device.h>
 #include <linux/delay.h>
 #include <linux/crypto.h>
 #include <linux/cryptohash.h>
@@ -780,7 +781,7 @@ static void atmel_sha_finish_req(struct ahash_request *req, int err)
 	dd->flags &= ~(SHA_FLAGS_BUSY | SHA_FLAGS_FINAL | SHA_FLAGS_CPU |
 			SHA_FLAGS_DMA_READY | SHA_FLAGS_OUTPUT_READY);
 
-	clk_disable_unprepare(dd->iclk);
+	clk_disable(dd->iclk);
 
 	if (req->base.complete)
 		req->base.complete(&req->base, err);
@@ -791,7 +792,7 @@ static void atmel_sha_finish_req(struct ahash_request *req, int err)
 
 static int atmel_sha_hw_init(struct atmel_sha_dev *dd)
 {
-	clk_prepare_enable(dd->iclk);
+	clk_enable(dd->iclk);
 
 	if (!(SHA_FLAGS_INIT & dd->flags)) {
 		atmel_sha_write(dd, SHA_CR, SHA_CR_SWRST);
@@ -816,7 +817,7 @@ static void atmel_sha_hw_version_init(struct atmel_sha_dev *dd)
 	dev_info(dd->dev,
 			"version: 0x%x\n", dd->hw_version);
 
-	clk_disable_unprepare(dd->iclk);
+	clk_disable(dd->iclk);
 }
 
 static int atmel_sha_handle_queue(struct atmel_sha_dev *dd,
@@ -956,7 +957,9 @@ static int atmel_sha_finup(struct ahash_request *req)
 	ctx->flags |= SHA_FLAGS_FINUP;
 
 	err1 = atmel_sha_update(req);
-	if (err1 == -EINPROGRESS || err1 == -EBUSY)
+	if (err1 == -EINPROGRESS ||
+	    (err1 == -EBUSY && (ahash_request_flags(req) &
+				CRYPTO_TFM_REQ_MAY_BACKLOG)))
 		return err1;
 
 	/*
@@ -1263,32 +1266,29 @@ static int atmel_sha_dma_init(struct atmel_sha_dev *dd,
 	int err = -ENOMEM;
 	dma_cap_mask_t mask_in;
 
-	if (pdata && pdata->dma_slave->rxdata.dma_dev) {
-		/* Try to grab DMA channel */
-		dma_cap_zero(mask_in);
-		dma_cap_set(DMA_SLAVE, mask_in);
+	/* Try to grab DMA channel */
+	dma_cap_zero(mask_in);
+	dma_cap_set(DMA_SLAVE, mask_in);
 
-		dd->dma_lch_in.chan = dma_request_channel(mask_in,
-				atmel_sha_filter, &pdata->dma_slave->rxdata);
-
-		if (!dd->dma_lch_in.chan)
-			return err;
-
-		dd->dma_lch_in.dma_conf.direction = DMA_MEM_TO_DEV;
-		dd->dma_lch_in.dma_conf.dst_addr = dd->phys_base +
-			SHA_REG_DIN(0);
-		dd->dma_lch_in.dma_conf.src_maxburst = 1;
-		dd->dma_lch_in.dma_conf.src_addr_width =
-			DMA_SLAVE_BUSWIDTH_4_BYTES;
-		dd->dma_lch_in.dma_conf.dst_maxburst = 1;
-		dd->dma_lch_in.dma_conf.dst_addr_width =
-			DMA_SLAVE_BUSWIDTH_4_BYTES;
-		dd->dma_lch_in.dma_conf.device_fc = false;
-
-		return 0;
+	dd->dma_lch_in.chan = dma_request_slave_channel_compat(mask_in,
+			atmel_sha_filter, &pdata->dma_slave->rxdata, dd->dev, "tx");
+	if (!dd->dma_lch_in.chan) {
+		dev_warn(dd->dev, "no DMA channel available\n");
+		return err;
 	}
 
-	return -ENODEV;
+	dd->dma_lch_in.dma_conf.direction = DMA_MEM_TO_DEV;
+	dd->dma_lch_in.dma_conf.dst_addr = dd->phys_base +
+		SHA_REG_DIN(0);
+	dd->dma_lch_in.dma_conf.src_maxburst = 1;
+	dd->dma_lch_in.dma_conf.src_addr_width =
+		DMA_SLAVE_BUSWIDTH_4_BYTES;
+	dd->dma_lch_in.dma_conf.dst_maxburst = 1;
+	dd->dma_lch_in.dma_conf.dst_addr_width =
+		DMA_SLAVE_BUSWIDTH_4_BYTES;
+	dd->dma_lch_in.dma_conf.device_fc = false;
+
+	return 0;
 }
 
 static void atmel_sha_dma_cleanup(struct atmel_sha_dev *dd)
@@ -1326,6 +1326,47 @@ static void atmel_sha_get_cap(struct atmel_sha_dev *dd)
 	}
 }
 
+#if defined(CONFIG_OF)
+static const struct of_device_id atmel_sha_dt_ids[] = {
+	{ .compatible = "atmel,at91sam9g46-sha" },
+	{ /* sentinel */ }
+};
+
+MODULE_DEVICE_TABLE(of, atmel_sha_dt_ids);
+
+static struct crypto_platform_data *atmel_sha_of_init(struct platform_device *pdev)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct crypto_platform_data *pdata;
+
+	if (!np) {
+		dev_err(&pdev->dev, "device node not found\n");
+		return ERR_PTR(-EINVAL);
+	}
+
+	pdata = devm_kzalloc(&pdev->dev, sizeof(*pdata), GFP_KERNEL);
+	if (!pdata) {
+		dev_err(&pdev->dev, "could not allocate memory for pdata\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	pdata->dma_slave = devm_kzalloc(&pdev->dev,
+					sizeof(*(pdata->dma_slave)),
+					GFP_KERNEL);
+	if (!pdata->dma_slave) {
+		dev_err(&pdev->dev, "could not allocate memory for dma_slave\n");
+		return ERR_PTR(-ENOMEM);
+	}
+
+	return pdata;
+}
+#else /* CONFIG_OF */
+static inline struct crypto_platform_data *atmel_sha_of_init(struct platform_device *dev)
+{
+	return ERR_PTR(-EINVAL);
+}
+#endif
+
 static int atmel_sha_probe(struct platform_device *pdev)
 {
 	struct atmel_sha_dev *sha_dd;
@@ -1335,7 +1376,8 @@ static int atmel_sha_probe(struct platform_device *pdev)
 	unsigned long sha_phys_size;
 	int err;
 
-	sha_dd = kzalloc(sizeof(struct atmel_sha_dev), GFP_KERNEL);
+	sha_dd = devm_kzalloc(&pdev->dev, sizeof(struct atmel_sha_dev),
+				GFP_KERNEL);
 	if (sha_dd == NULL) {
 		dev_err(dev, "unable to alloc data struct.\n");
 		err = -ENOMEM;
@@ -1389,11 +1431,15 @@ static int atmel_sha_probe(struct platform_device *pdev)
 	}
 
 	sha_dd->io_base = ioremap(sha_dd->phys_base, sha_phys_size);
-	if (!sha_dd->io_base) {
+	if (IS_ERR(sha_dd->io_base)) {
 		dev_err(dev, "can't ioremap\n");
-		err = -ENOMEM;
+		err = PTR_ERR(sha_dd->io_base);
 		goto sha_io_err;
 	}
+
+	err = clk_prepare(sha_dd->iclk);
+	if (err)
+		goto res_err;
 
 	atmel_sha_hw_version_init(sha_dd);
 
@@ -1402,13 +1448,23 @@ static int atmel_sha_probe(struct platform_device *pdev)
 	if (sha_dd->caps.has_dma) {
 		pdata = pdev->dev.platform_data;
 		if (!pdata) {
-			dev_err(&pdev->dev, "platform data not available\n");
+			pdata = atmel_sha_of_init(pdev);
+			if (IS_ERR(pdata)) {
+				dev_err(&pdev->dev, "platform data not available\n");
+				err = PTR_ERR(pdata);
+				goto iclk_unprepare;
+			}
+		}
+		if (!pdata->dma_slave) {
 			err = -ENXIO;
-			goto err_pdata;
+			goto iclk_unprepare;
 		}
 		err = atmel_sha_dma_init(sha_dd, pdata);
 		if (err)
 			goto err_sha_dma;
+
+		dev_info(dev, "using %s for DMA transfers\n",
+				dma_chan_name(sha_dd->dma_lch_in.chan));
 	}
 
 	spin_lock(&atmel_sha.lock);
@@ -1419,7 +1475,9 @@ static int atmel_sha_probe(struct platform_device *pdev)
 	if (err)
 		goto err_algs;
 
-	dev_info(dev, "Atmel SHA1/SHA256\n");
+	dev_info(dev, "Atmel SHA1/SHA256%s%s\n",
+			sha_dd->caps.has_sha224 ? "/SHA224" : "",
+			sha_dd->caps.has_sha_384_512 ? "/SHA384/SHA512" : "");
 
 	return 0;
 
@@ -1430,7 +1488,8 @@ err_algs:
 	if (sha_dd->caps.has_dma)
 		atmel_sha_dma_cleanup(sha_dd);
 err_sha_dma:
-err_pdata:
+iclk_unprepare:
+	clk_unprepare(sha_dd->iclk);
 	iounmap(sha_dd->io_base);
 sha_io_err:
 	clk_put(sha_dd->iclk);
@@ -1438,8 +1497,6 @@ clk_err:
 	free_irq(sha_dd->irq, sha_dd);
 res_err:
 	tasklet_kill(&sha_dd->done_task);
-	kfree(sha_dd);
-	sha_dd = NULL;
 sha_dd_err:
 	dev_err(dev, "initialization failed.\n");
 
@@ -1464,15 +1521,7 @@ static int atmel_sha_remove(struct platform_device *pdev)
 	if (sha_dd->caps.has_dma)
 		atmel_sha_dma_cleanup(sha_dd);
 
-	iounmap(sha_dd->io_base);
-
-	clk_put(sha_dd->iclk);
-
-	if (sha_dd->irq >= 0)
-		free_irq(sha_dd->irq, sha_dd);
-
-	kfree(sha_dd);
-	sha_dd = NULL;
+	clk_unprepare(sha_dd->iclk);
 
 	return 0;
 }
@@ -1483,6 +1532,7 @@ static struct platform_driver atmel_sha_driver = {
 	.driver		= {
 		.name	= "atmel_sha",
 		.owner	= THIS_MODULE,
+		.of_match_table	= of_match_ptr(atmel_sha_dt_ids),
 	},
 };
 

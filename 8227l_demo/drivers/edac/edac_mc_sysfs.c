@@ -7,7 +7,7 @@
  *
  * Written Doug Thompson <norsk5@xmission.com> www.softwarebitmaker.com
  *
- * (c) 2012-2013 - Mauro Carvalho Chehab <mchehab@redhat.com>
+ * (c) 2012-2013 - Mauro Carvalho Chehab
  *	The entire API were re-written, and ported to use struct device
  *
  */
@@ -26,7 +26,7 @@
 static int edac_mc_log_ue = 1;
 static int edac_mc_log_ce = 1;
 static int edac_mc_panic_on_ue;
-static int edac_mc_poll_msec = 1000;
+static unsigned int edac_mc_poll_msec = 1000;
 
 /* Getter functions for above */
 int edac_mc_get_log_ue(void)
@@ -45,30 +45,30 @@ int edac_mc_get_panic_on_ue(void)
 }
 
 /* this is temporary */
-int edac_mc_get_poll_msec(void)
+unsigned int edac_mc_get_poll_msec(void)
 {
 	return edac_mc_poll_msec;
 }
 
 static int edac_set_poll_msec(const char *val, struct kernel_param *kp)
 {
-	unsigned long l;
+	unsigned int i;
 	int ret;
 
 	if (!val)
 		return -EINVAL;
 
-	ret = kstrtoul(val, 0, &l);
+	ret = kstrtouint(val, 0, &i);
 	if (ret)
 		return ret;
 
-	if (l < 1000)
+	if (i < 1000)
 		return -EINVAL;
 
-	*((unsigned long *)kp->arg) = l;
+	*((unsigned int *)kp->arg) = i;
 
 	/* notify edac_mc engine to reset the poll period */
-	edac_mc_reset_delay_period(l);
+	edac_mc_reset_delay_period(i);
 
 	return 0;
 }
@@ -82,7 +82,7 @@ MODULE_PARM_DESC(edac_mc_log_ue,
 module_param(edac_mc_log_ce, int, 0644);
 MODULE_PARM_DESC(edac_mc_log_ce,
 		 "Log correctable error to console: 0=off 1=on");
-module_param_call(edac_mc_poll_msec, edac_set_poll_msec, param_get_int,
+module_param_call(edac_mc_poll_msec, edac_set_poll_msec, param_get_uint,
 		  &edac_mc_poll_msec, 0644);
 MODULE_PARM_DESC(edac_mc_poll_msec, "Polling period in milliseconds");
 
@@ -108,7 +108,9 @@ static const char * const mem_types[] = {
 	[MEM_RDDR2] = "Registered-DDR2",
 	[MEM_XDR] = "XDR",
 	[MEM_DDR3] = "Unbuffered-DDR3",
-	[MEM_RDDR3] = "Registered-DDR3"
+	[MEM_RDDR3] = "Registered-DDR3",
+	[MEM_DDR4] = "Unbuffered-DDR4",
+	[MEM_RDDR4] = "Registered-DDR4"
 };
 
 static const char * const dev_types[] = {
@@ -319,6 +321,10 @@ DEVICE_CHANNEL(ch4_dimm_label, S_IRUGO | S_IWUSR,
 	channel_dimm_label_show, channel_dimm_label_store, 4);
 DEVICE_CHANNEL(ch5_dimm_label, S_IRUGO | S_IWUSR,
 	channel_dimm_label_show, channel_dimm_label_store, 5);
+DEVICE_CHANNEL(ch6_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 6);
+DEVICE_CHANNEL(ch7_dimm_label, S_IRUGO | S_IWUSR,
+	channel_dimm_label_show, channel_dimm_label_store, 7);
 
 /* Total possible dynamic DIMM Label attribute file table */
 static struct device_attribute *dynamic_csrow_dimm_attr[] = {
@@ -327,7 +333,9 @@ static struct device_attribute *dynamic_csrow_dimm_attr[] = {
 	&dev_attr_legacy_ch2_dimm_label.attr,
 	&dev_attr_legacy_ch3_dimm_label.attr,
 	&dev_attr_legacy_ch4_dimm_label.attr,
-	&dev_attr_legacy_ch5_dimm_label.attr
+	&dev_attr_legacy_ch5_dimm_label.attr,
+	&dev_attr_legacy_ch6_dimm_label.attr,
+	&dev_attr_legacy_ch7_dimm_label.attr,
 };
 
 /* possible dynamic channel ce_count attribute files */
@@ -343,6 +351,10 @@ DEVICE_CHANNEL(ch4_ce_count, S_IRUGO,
 		   channel_ce_count_show, NULL, 4);
 DEVICE_CHANNEL(ch5_ce_count, S_IRUGO,
 		   channel_ce_count_show, NULL, 5);
+DEVICE_CHANNEL(ch6_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 6);
+DEVICE_CHANNEL(ch7_ce_count, S_IRUGO,
+		   channel_ce_count_show, NULL, 7);
 
 /* Total possible dynamic ce_count attribute file table */
 static struct device_attribute *dynamic_csrow_ce_count_attr[] = {
@@ -351,7 +363,9 @@ static struct device_attribute *dynamic_csrow_ce_count_attr[] = {
 	&dev_attr_legacy_ch2_ce_count.attr,
 	&dev_attr_legacy_ch3_ce_count.attr,
 	&dev_attr_legacy_ch4_ce_count.attr,
-	&dev_attr_legacy_ch5_ce_count.attr
+	&dev_attr_legacy_ch5_ce_count.attr,
+	&dev_attr_legacy_ch6_ce_count.attr,
+	&dev_attr_legacy_ch7_ce_count.attr,
 };
 
 static inline int nr_pages_per_csrow(struct csrow_info *csrow)
@@ -385,8 +399,10 @@ static int edac_create_csrow_object(struct mem_ctl_info *mci,
 		 dev_name(&csrow->dev));
 
 	err = device_add(&csrow->dev);
-	if (err < 0)
+	if (err < 0) {
+		put_device(&csrow->dev);
 		return err;
+	}
 
 	for (chan = 0; chan < csrow->nr_channels; chan++) {
 		/* Only expose populated DIMMs */
@@ -682,7 +698,7 @@ static ssize_t mci_sdram_scrub_rate_store(struct device *dev,
 	unsigned long bandwidth = 0;
 	int new_bw = 0;
 
-	if (strict_strtoul(data, 10, &bandwidth) < 0)
+	if (kstrtoul(data, 10, &bandwidth) < 0)
 		return -EINVAL;
 
 	new_bw = mci->set_sdram_scrub_rate(mci, bandwidth);
@@ -916,7 +932,7 @@ void __exit edac_debugfs_exit(void)
 	debugfs_remove(edac_debugfs);
 }
 
-int edac_create_debug_nodes(struct mem_ctl_info *mci)
+static int edac_create_debug_nodes(struct mem_ctl_info *mci)
 {
 	struct dentry *d, *parent;
 	char name[80];

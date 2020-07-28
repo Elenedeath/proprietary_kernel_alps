@@ -261,11 +261,19 @@ static int adis16480_debugfs_init(struct iio_dev *indio_dev)
 
 #endif
 
-static int adis16480_set_freq(struct adis16480 *st, unsigned int freq)
+static int adis16480_set_freq(struct iio_dev *indio_dev, int val, int val2)
 {
+	struct adis16480 *st = iio_priv(indio_dev);
 	unsigned int t;
 
-	t = 2460000 / freq;
+	if (val < 0 || val2 < 0)
+		return -EINVAL;
+
+	t =  val * 1000 + val2 / 1000;
+	if (t == 0)
+		return -EINVAL;
+
+	t = 2460000 / t;
 	if (t > 2048)
 		t = 2048;
 
@@ -275,64 +283,23 @@ static int adis16480_set_freq(struct adis16480 *st, unsigned int freq)
 	return adis_write_reg_16(&st->adis, ADIS16480_REG_DEC_RATE, t);
 }
 
-static int adis16480_get_freq(struct adis16480 *st, unsigned int *freq)
+static int adis16480_get_freq(struct iio_dev *indio_dev, int *val, int *val2)
 {
+	struct adis16480 *st = iio_priv(indio_dev);
 	uint16_t t;
 	int ret;
+	unsigned freq;
 
 	ret = adis_read_reg_16(&st->adis, ADIS16480_REG_DEC_RATE, &t);
 	if (ret < 0)
 		return ret;
 
-	*freq = 2460000 / (t + 1);
+	freq = 2460000 / (t + 1);
+	*val = freq / 1000;
+	*val2 = (freq % 1000) * 1000;
 
-	return 0;
+	return IIO_VAL_INT_PLUS_MICRO;
 }
-
-static ssize_t adis16480_read_frequency(struct device *dev,
-		struct device_attribute *attr,
-		char *buf)
-{
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
-	struct adis16480 *st = iio_priv(indio_dev);
-	unsigned int freq;
-	int ret;
-
-	ret = adis16480_get_freq(st, &freq);
-	if (ret < 0)
-		return ret;
-
-	return sprintf(buf, "%d.%.3d\n", freq / 1000, freq % 1000);
-}
-
-static ssize_t adis16480_write_frequency(struct device *dev,
-		struct device_attribute *attr,
-		const char *buf,
-		size_t len)
-{
-	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
-	struct adis16480 *st = iio_priv(indio_dev);
-	int freq_int, freq_fract;
-	long val;
-	int ret;
-
-	ret = iio_str_to_fixpoint(buf, 100, &freq_int, &freq_fract);
-	if (ret)
-		return ret;
-
-	val = freq_int * 1000 + freq_fract;
-
-	if (val <= 0)
-		return -EINVAL;
-
-	ret = adis16480_set_freq(st, val);
-
-	return ret ? ret : len;
-}
-
-static IIO_DEV_ATTR_SAMP_FREQ(S_IWUSR | S_IRUGO,
-			      adis16480_read_frequency,
-			      adis16480_write_frequency);
 
 enum {
 	ADIS16480_SCAN_GYRO_X,
@@ -405,12 +372,14 @@ static int adis16480_get_calibbias(struct iio_dev *indio_dev,
 	case IIO_MAGN:
 	case IIO_PRESSURE:
 		ret = adis_read_reg_16(&st->adis, reg, &val16);
-		*bias = sign_extend32(val16, 15);
+		if (ret == 0)
+			*bias = sign_extend32(val16, 15);
 		break;
 	case IIO_ANGL_VEL:
 	case IIO_ACCEL:
 		ret = adis_read_reg_32(&st->adis, reg, &val32);
-		*bias = sign_extend32(val32, 31);
+		if (ret == 0)
+			*bias = sign_extend32(val32, 31);
 		break;
 	default:
 			ret = -EINVAL;
@@ -577,6 +546,8 @@ static int adis16480_read_raw(struct iio_dev *indio_dev,
 		return adis16480_get_calibscale(indio_dev, chan, val);
 	case IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY:
 		return adis16480_get_filter_freq(indio_dev, chan, val);
+	case IIO_CHAN_INFO_SAMP_FREQ:
+		return adis16480_get_freq(indio_dev, val, val2);
 	default:
 		return -EINVAL;
 	}
@@ -592,6 +563,9 @@ static int adis16480_write_raw(struct iio_dev *indio_dev,
 		return adis16480_set_calibscale(indio_dev, chan, val);
 	case IIO_CHAN_INFO_LOW_PASS_FILTER_3DB_FREQUENCY:
 		return adis16480_set_filter_freq(indio_dev, chan, val);
+	case IIO_CHAN_INFO_SAMP_FREQ:
+		return adis16480_set_freq(indio_dev, val, val2);
+
 	default:
 		return -EINVAL;
 	}
@@ -606,6 +580,7 @@ static int adis16480_write_raw(struct iio_dev *indio_dev,
 			BIT(IIO_CHAN_INFO_CALIBBIAS) | \
 			_info_sep, \
 		.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE), \
+		.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ), \
 		.address = (_address), \
 		.scan_index = (_si), \
 		.scan_type = { \
@@ -644,6 +619,7 @@ static int adis16480_write_raw(struct iio_dev *indio_dev,
 		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) | \
 			BIT(IIO_CHAN_INFO_CALIBBIAS) | \
 			BIT(IIO_CHAN_INFO_SCALE), \
+		.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ), \
 		.address = ADIS16480_REG_BAROM_OUT, \
 		.scan_index = ADIS16480_SCAN_BARO, \
 		.scan_type = { \
@@ -661,6 +637,7 @@ static int adis16480_write_raw(struct iio_dev *indio_dev,
 		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) | \
 			BIT(IIO_CHAN_INFO_SCALE) | \
 			BIT(IIO_CHAN_INFO_OFFSET), \
+		.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ), \
 		.address = ADIS16480_REG_TEMP_OUT, \
 		.scan_index = ADIS16480_SCAN_TEMP, \
 		.scan_type = { \
@@ -724,7 +701,7 @@ static const struct adis16480_chip_info adis16480_chip_info[] = {
 		.gyro_max_val = IIO_RAD_TO_DEGREE(22500),
 		.gyro_max_scale = 450,
 		.accel_max_val = IIO_M_S_2_TO_G(12500),
-		.accel_max_scale = 5,
+		.accel_max_scale = 10,
 	},
 	[ADIS16485] = {
 		.channels = adis16485_channels,
@@ -744,21 +721,12 @@ static const struct adis16480_chip_info adis16480_chip_info[] = {
 	},
 };
 
-static struct attribute *adis16480_attributes[] = {
-	&iio_dev_attr_sampling_frequency.dev_attr.attr,
-	NULL
-};
-
-static const struct attribute_group adis16480_attribute_group = {
-	.attrs = adis16480_attributes,
-};
-
 static const struct iio_info adis16480_info = {
-	.attrs = &adis16480_attribute_group,
 	.read_raw = &adis16480_read_raw,
 	.write_raw = &adis16480_write_raw,
 	.update_scan_mode = adis_update_scan_mode,
 	.driver_module = THIS_MODULE,
+	.debugfs_reg_access = adis_debugfs_reg_access,
 };
 
 static int adis16480_stop_device(struct iio_dev *indio_dev)
@@ -866,7 +834,7 @@ static int adis16480_probe(struct spi_device *spi)
 	struct adis16480 *st;
 	int ret;
 
-	indio_dev = iio_device_alloc(sizeof(*st));
+	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
 	if (indio_dev == NULL)
 		return -ENOMEM;
 
@@ -884,11 +852,11 @@ static int adis16480_probe(struct spi_device *spi)
 
 	ret = adis_init(&st->adis, indio_dev, spi, &adis16480_data);
 	if (ret)
-		goto error_free_dev;
+		return ret;
 
 	ret = adis_setup_buffer_and_trigger(&st->adis, indio_dev, NULL);
 	if (ret)
-		goto error_free_dev;
+		return ret;
 
 	ret = adis16480_initial_setup(indio_dev);
 	if (ret)
@@ -906,8 +874,6 @@ error_stop_device:
 	adis16480_stop_device(indio_dev);
 error_cleanup_buffer:
 	adis_cleanup_buffer_and_trigger(&st->adis, indio_dev);
-error_free_dev:
-	iio_device_free(indio_dev);
 	return ret;
 }
 
@@ -920,8 +886,6 @@ static int adis16480_remove(struct spi_device *spi)
 	adis16480_stop_device(indio_dev);
 
 	adis_cleanup_buffer_and_trigger(&st->adis, indio_dev);
-
-	iio_device_free(indio_dev);
 
 	return 0;
 }

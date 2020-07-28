@@ -141,6 +141,7 @@
 #include <net/icmp.h>
 #include <net/raw.h>
 #include <net/checksum.h>
+#include <net/inet_ecn.h>
 #include <linux/netfilter_ipv4.h>
 #include <net/xfrm.h>
 #include <linux/mroute.h>
@@ -358,31 +359,9 @@ static int ip_rcv_finish(struct sk_buff *skb)
 	if (rt->rt_type == RTN_MULTICAST) {
 		IP_UPD_PO_STATS_BH(dev_net(rt->dst.dev), IPSTATS_MIB_INMCAST,
 				skb->len);
-	} else if (rt->rt_type == RTN_BROADCAST) {
+	} else if (rt->rt_type == RTN_BROADCAST)
 		IP_UPD_PO_STATS_BH(dev_net(rt->dst.dev), IPSTATS_MIB_INBCAST,
 				skb->len);
-	} else if (skb->pkt_type == PACKET_BROADCAST ||
-		   skb->pkt_type == PACKET_MULTICAST) {
-		struct in_device *in_dev = __in_dev_get_rcu(skb->dev);
- 		/* RFC 1122 3.3.6:
-		 *
-		 *   When a host sends a datagram to a link-layer broadcast
-		 *   address, the IP destination address MUST be a legal IP
-		 *   broadcast or IP multicast address.
-		 *
-		 *   A host SHOULD silently discard a datagram that is received
-		 *   via a link-layer broadcast (see Section 2.4) but does not
-		 *   specify an IP multicast or broadcast destination address.
-		 *
-		 * This doesn't explicitly say L2 *broadcast*, but broadcast is
-		 * in a way a form of multicast and the most common use case for
-		 * this is 802.11 protecting against cross-station spoofing (the
-		 * so-called "hole-196" attack) so do it for both.
-		 */
-		if (in_dev &&
-		    IN_DEV_ORCONF(in_dev, DROP_UNICAST_IN_L2_MULTICAST))
-			goto drop;
-	}
 
 	return dst_input(skb);
 
@@ -431,6 +410,13 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 
 	if (iph->ihl < 5 || iph->version != 4)
 		goto inhdr_error;
+
+	BUILD_BUG_ON(IPSTATS_MIB_ECT1PKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_ECT_1);
+	BUILD_BUG_ON(IPSTATS_MIB_ECT0PKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_ECT_0);
+	BUILD_BUG_ON(IPSTATS_MIB_CEPKTS != IPSTATS_MIB_NOECTPKTS + INET_ECN_CE);
+	IP_ADD_STATS_BH(dev_net(dev),
+			IPSTATS_MIB_NOECTPKTS + (iph->tos & INET_ECN_MASK),
+			max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
 
 	if (!pskb_may_pull(skb, iph->ihl*4))
 		goto inhdr_error;

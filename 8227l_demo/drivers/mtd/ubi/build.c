@@ -41,16 +41,14 @@
 #include <linux/kthread.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
+#include <linux/major.h>
 #include "ubi.h"
-#ifdef CONFIG_MTK_COMBO_NAND_SUPPORT
-#include <linux/mtd/combo_nand.h>
-#endif
 
 /* Maximum length of the 'mtd=' parameter */
 #define MTD_PARAM_LEN_MAX 64
 
 /* Maximum number of comma-separated items in the 'mtd=' parameter */
-#define MTD_PARAM_MAX_COUNT 3
+#define MTD_PARAM_MAX_COUNT 4
 
 /* Maximum value for the number of bad PEBs per 1024 PEBs */
 #define MAX_MTD_UBI_BEB_LIMIT 768
@@ -70,6 +68,7 @@
  */
 struct mtd_dev_param {
 	char name[MTD_PARAM_LEN_MAX];
+	int ubi_num;
 	int vid_hdr_offs;
 	int max_beb_per1024;
 };
@@ -81,11 +80,7 @@ static int __initdata mtd_devs;
 static struct mtd_dev_param __initdata mtd_dev_param[UBI_MAX_DEVICES];
 #ifdef CONFIG_MTD_UBI_FASTMAP
 /* UBI module parameter to enable fastmap automatically on non-fastmap images */
-#ifdef CONFIG_MTK_NAND_UBIFS_FASTMAP_SUPPORT
-static bool fm_autoconvert = 1;
-#else
-static bool fm_autoconvert = 0;
-#endif
+static bool fm_autoconvert;
 #endif
 /* Root UBI "class" object (corresponds to '/<sysfs>/class/ubi/') */
 struct class *ubi_class;
@@ -122,9 +117,6 @@ static struct class_attribute ubi_version =
 
 static ssize_t dev_attribute_show(struct device *dev,
 				  struct device_attribute *attr, char *buf);
-//MTK
-static ssize_t dev_attribute_store(struct device *dev, struct device_attribute *attr,
-			 const char *buf, size_t count);
 
 /* UBI device attributes (correspond to files in '/<sysfs>/class/ubi/ubiX') */
 static struct device_attribute dev_eraseblock_size =
@@ -137,32 +129,6 @@ static struct device_attribute dev_volumes_count =
 	__ATTR(volumes_count, S_IRUGO, dev_attribute_show, NULL);
 static struct device_attribute dev_max_ec =
 	__ATTR(max_ec, S_IRUGO, dev_attribute_show, NULL);
-//MTK start
-static struct device_attribute dev_lbb =
-	__ATTR(lbb, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_move_retry =
-	__ATTR(move_retry, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_ec_count =
-	__ATTR(ec_count, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_mean_ec =
-	__ATTR(mean_ec, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_ec_sum =
-	__ATTR(ec_sum, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_min_ec =
-	__ATTR(min_ec, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_wl_count =
-	__ATTR(wl_count, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_wl_size =
-	__ATTR(wl_size, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_scrub_count =
-	__ATTR(scrub_count, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_scrub_size =
-	__ATTR(scrub_size, S_IRUGO, dev_attribute_show, NULL);
-static struct device_attribute dev_wl_th =
-	__ATTR(wl_th, 00755, dev_attribute_show, dev_attribute_store);
-static struct device_attribute dev_torture =
-	__ATTR(torture, 00755, dev_attribute_show, NULL);
-//MTK end
 static struct device_attribute dev_reserved_for_bad =
 	__ATTR(reserved_for_bad, S_IRUGO, dev_attribute_show, NULL);
 static struct device_attribute dev_bad_peb_count =
@@ -368,26 +334,6 @@ int ubi_major2num(int major)
 	return ubi_num;
 }
 
-/* MTK: "Store" method for files in '/<sysfs>/class/ubi/ubiX/' */
-static ssize_t dev_attribute_store(struct device *dev, struct device_attribute *attr,
-			 const char *buf, size_t count)
-{
-	struct ubi_device *ubi;
-	int th=0;
-
-	ubi = container_of(dev, struct ubi_device, dev);
-	ubi = ubi_get_device(ubi->ubi_num);
-	if (!ubi)
-		return -ENODEV;
-
-	if (attr == &dev_wl_th)
-	{
-		sscanf(buf, "%d", &th);
-		printk("set th=%d\n", th);
-		ubi->wl_th = th;
-	}
-	return count;
-}
 /* "Show" method for files in '/<sysfs>/class/ubi/ubiX/' */
 static ssize_t dev_attribute_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
@@ -420,48 +366,6 @@ static ssize_t dev_attribute_show(struct device *dev,
 		ret = sprintf(buf, "%d\n", ubi->vol_count - UBI_INT_VOL_COUNT);
 	else if (attr == &dev_max_ec)
 		ret = sprintf(buf, "%d\n", ubi->max_ec);
-//MTK start
-	else if (attr == &dev_torture)
-		ret = sprintf(buf, "torture: %d\n", ubi->torture);
-	else if (attr == &dev_wl_th)
-		ret = sprintf(buf, "wl_th: %d\n", ubi->wl_th);
-	else if (attr == &dev_wl_count)
-		ret = sprintf(buf, "wl_count: %d\n", ubi->wl_count);
-	else if (attr == &dev_wl_size)
-		ret = sprintf(buf, "wl_size: %lld\n", ubi->wl_size);
-	else if (attr == &dev_scrub_count)
-		ret = sprintf(buf, "scrub_count: %d\n", ubi->scrub_count);
-	else if (attr == &dev_scrub_size)
-		ret = sprintf(buf, "scrub_size: %lld\n", ubi->scrub_size);
-	else if (attr == &dev_move_retry)
-		ret = sprintf(buf, "move_retry: %d\n", atomic_read(&ubi->move_retry));
-	else if (attr == &dev_lbb)
-		ret = sprintf(buf, "lbb: %d\n", atomic_read(&ubi->lbb));
-	else if (attr == &dev_ec_count)
-		ret = sprintf(buf, "ec_count: %d\n", atomic_read(&ubi->ec_count));
-	else if (attr == &dev_mean_ec)
-		ret = sprintf(buf, "mean_ec: %d\n", ubi->mean_ec);
-	else if (attr == &dev_ec_sum)
-		ret = sprintf(buf, "%lld\n", ubi->ec_sum);
-	else if (attr == &dev_min_ec) {
-		struct ubi_wl_entry *e=NULL, *efree=NULL, *eused=NULL; 
-		spin_lock(&ubi->wl_lock);
-		efree = rb_entry(rb_first(&ubi->free), struct ubi_wl_entry, u.rb);
-		eused = rb_entry(rb_first(&ubi->used), struct ubi_wl_entry, u.rb);
-		if(efree && eused) {
-			if(efree->ec < eused->ec)
-				e = efree;
-			else
-				e = eused;
-		} else if(efree){
-			e = efree;
-		} else {
-			e = eused;
-		}
-		ret = sprintf(buf, "%d\n", e->ec);
-		spin_unlock(&ubi->wl_lock);
-	}
-//MTK end
 	else if (attr == &dev_reserved_for_bad)
 		ret = sprintf(buf, "%d\n", ubi->beb_rsvd_pebs);
 	else if (attr == &dev_bad_peb_count)
@@ -525,44 +429,6 @@ static int ubi_sysfs_init(struct ubi_device *ubi, int *ref)
 	err = device_create_file(&ubi->dev, &dev_max_ec);
 	if (err)
 		return err;
-//MTK start
-	err = device_create_file(&ubi->dev, &dev_lbb);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_move_retry);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_ec_count);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_mean_ec);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_ec_sum);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_min_ec);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_wl_count);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_wl_size);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_scrub_count);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_scrub_size);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_wl_th);
-	if (err)
-		return err;
-	err = device_create_file(&ubi->dev, &dev_torture);
-	if (err)
-		return err;
-//MTK end
 	err = device_create_file(&ubi->dev, &dev_reserved_for_bad);
 	if (err)
 		return err;
@@ -796,13 +662,8 @@ static int io_init(struct ubi_device *ubi, int max_beb_per1024)
 	 * physical eraseblocks maximum.
 	 */
 
-#ifdef CONFIG_MTK_COMBO_NAND_SUPPORT
-	ubi->peb_size   = COMBO_NAND_BLOCK_SIZE;
-	ubi->peb_count  = (int)div_u64(ubi->mtd->size, ubi->peb_size);
-#else
 	ubi->peb_size   = ubi->mtd->erasesize;
 	ubi->peb_count  = mtd_div_by_eb(ubi->mtd->size, ubi->mtd);
-#endif
 	ubi->flash_size = ubi->mtd->size;
 
 	if (mtd_can_have_bb(ubi->mtd)) {
@@ -815,13 +676,8 @@ static int io_init(struct ubi_device *ubi, int max_beb_per1024)
 		ubi->nor_flash = 1;
 	}
 
-#ifdef CONFIG_MTK_COMBO_NAND_SUPPORT
-	ubi->min_io_size = COMBO_NAND_PAGE_SIZE;
-	ubi->hdrs_min_io_size = ubi->min_io_size >> ubi->mtd->subpage_sft;
-#else
 	ubi->min_io_size = ubi->mtd->writesize;
 	ubi->hdrs_min_io_size = ubi->mtd->writesize >> ubi->mtd->subpage_sft;
-#endif
 
 	/*
 	 * Make sure minimal I/O unit is power of 2. Note, there is no
@@ -838,14 +694,7 @@ static int io_init(struct ubi_device *ubi, int max_beb_per1024)
 	ubi_assert(ubi->hdrs_min_io_size <= ubi->min_io_size);
 	ubi_assert(ubi->min_io_size % ubi->hdrs_min_io_size == 0);
 
-#ifdef CONFIG_MTK_COMBO_NAND_SUPPORT
-	ubi->max_write_size = COMBO_NAND_PAGE_SIZE;
-#else
 	ubi->max_write_size = ubi->mtd->writebufsize;
-#endif
-#ifdef CONFIG_MTK_MLC_NAND_SUPPORT
-	ubi->max_write_size = ubi->mtd->erasesize/4;
-#endif
 	/*
 	 * Maximum write size has to be greater or equivalent to min. I/O
 	 * size, and be multiple of min. I/O size.
@@ -931,17 +780,6 @@ static int io_init(struct ubi_device *ubi, int max_beb_per1024)
 			ubi->mtd->index);
 		ubi->ro_mode = 1;
 	}
-
-	ubi_msg("physical eraseblock size:   %d bytes (%d KiB)",
-		ubi->peb_size, ubi->peb_size >> 10);
-	ubi_msg("logical eraseblock size:    %d bytes", ubi->leb_size);
-	ubi_msg("smallest flash I/O unit:    %d", ubi->min_io_size);
-	if (ubi->hdrs_min_io_size != ubi->min_io_size)
-		ubi_msg("sub-page size:              %d",
-			ubi->hdrs_min_io_size);
-	ubi_msg("VID header offset:          %d (aligned %d)",
-		ubi->vid_hdr_offset, ubi->vid_hdr_aloffset);
-	ubi_msg("data offset:                %d", ubi->leb_start);
 
 	/*
 	 * Note, ideally, we have to initialize @ubi->bad_peb_count here. But
@@ -1031,7 +869,6 @@ int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
 {
 	struct ubi_device *ubi;
 	int i, err, ref = 0;
-	unsigned long long attach_time = 0;
 
 	if (max_beb_per1024 < 0 || max_beb_per1024 > MAX_MTD_UBI_BEB_LIMIT)
 		return -EINVAL;
@@ -1068,6 +905,17 @@ int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
 		return -EINVAL;
 	}
 
+	/*
+	 * Both UBI and UBIFS have been designed for SLC NAND and NOR flashes.
+	 * MLC NAND is different and needs special care, otherwise UBI or UBIFS
+	 * will die soon and you will lose all your data.
+	 */
+	if (mtd->type == MTD_MLCNANDFLASH) {
+		pr_err("ubi: refuse attaching mtd%d - MLC NAND is not supported\n",
+			mtd->index);
+		return -EINVAL;
+	}
+
 	if (ubi_num == UBI_DEV_NUM_AUTO) {
 		/* Search for an empty slot in the @ubi_devices array */
 		for (ubi_num = 0; ubi_num < UBI_MAX_DEVICES; ubi_num++)
@@ -1097,11 +945,6 @@ int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
 	ubi->ubi_num = ubi_num;
 	ubi->vid_hdr_offset = vid_hdr_offset;
 	ubi->autoresize_vol_id = -1;
-//MTK start
-	ubi->wl_th = CONFIG_MTD_UBI_WL_THRESHOLD;
-	atomic_set(&ubi->ec_count, 0);
-	atomic_set(&ubi->move_retry, 0);
-//MTK end
 
 #ifdef CONFIG_MTD_UBI_FASTMAP
 	ubi->fm_pool.used = ubi->fm_pool.size = 0;
@@ -1145,17 +988,16 @@ int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
 		goto out_free;
 
 	err = -ENOMEM;
-	ubi->peb_buf = kmalloc(ubi->peb_size, GFP_KERNEL);
+	ubi->peb_buf = vmalloc(ubi->peb_size);
 	if (!ubi->peb_buf)
 		goto out_free;
 
 #ifdef CONFIG_MTD_UBI_FASTMAP
 	ubi->fm_size = ubi_calc_fm_size(ubi);
-	ubi->fm_buf = kzalloc(ubi->fm_size, GFP_KERNEL);
+	ubi->fm_buf = vzalloc(ubi->fm_size);
 	if (!ubi->fm_buf)
 		goto out_free;
 #endif
-	attach_time = sched_clock();
 	err = ubi_attach(ubi, 0);
 	if (err) {
 		ubi_err("failed to attach mtd%d, error %d", mtd->index, err);
@@ -1179,7 +1021,7 @@ int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
 	if (err)
 		goto out_uif;
 
-	ubi->bgt_thread = kthread_create(ubi_thread, ubi, ubi->bgt_name);
+	ubi->bgt_thread = kthread_create(ubi_thread, ubi, "%s", ubi->bgt_name);
 	if (IS_ERR(ubi->bgt_thread)) {
 		err = PTR_ERR(ubi->bgt_thread);
 		ubi_err("cannot spawn \"%s\", error %d", ubi->bgt_name,
@@ -1187,8 +1029,6 @@ int ubi_attach_mtd_dev(struct mtd_info *mtd, int ubi_num,
 		goto out_debugfs;
 	}
 
-	attach_time = sched_clock() - attach_time;
-	do_div(attach_time, 1000000);
 	ubi_msg("attached mtd%d (name \"%s\", size %llu MiB) to ubi%d",
 		mtd->index, mtd->name, ubi->flash_size >> 20, ubi_num);
 	ubi_msg("PEB size: %d bytes (%d KiB), LEB size: %d bytes",
@@ -1230,10 +1070,10 @@ out_detach:
 	ubi_devices[ubi_num] = NULL;
 	ubi_wl_close(ubi);
 	ubi_free_internal_volumes(ubi);
-	kfree(ubi->vtbl);
+	vfree(ubi->vtbl);
 out_free:
-	kfree(ubi->peb_buf);
-	kfree(ubi->fm_buf);
+	vfree(ubi->peb_buf);
+	vfree(ubi->fm_buf);
 	if (ref)
 		put_device(&ubi->dev);
 	else
@@ -1306,15 +1146,11 @@ int ubi_detach_mtd_dev(int ubi_num, int anyway)
 
 	ubi_wl_close(ubi);
 	ubi_free_internal_volumes(ubi);
-	kfree(ubi->vtbl);
-	put_mtd_device(ubi->mtd);
-#ifdef CONFIG_BLB
-	kfree(ubi->databuf);
-	kfree(ubi->oobbuf);
-#endif
-	kfree(ubi->peb_buf);
-	kfree(ubi->fm_buf);
+	vfree(ubi->vtbl);
+	vfree(ubi->peb_buf);
+	vfree(ubi->fm_buf);
 	ubi_msg("mtd%d is detached from ubi%d", ubi->mtd->index, ubi->ubi_num);
+	put_mtd_device(ubi->mtd);
 	put_device(&ubi->dev);
 	return 0;
 }
@@ -1423,8 +1259,10 @@ static int __init ubi_init(void)
 	ubi_wl_entry_slab = kmem_cache_create("ubi_wl_entry_slab",
 					      sizeof(struct ubi_wl_entry),
 					      0, 0, NULL);
-	if (!ubi_wl_entry_slab)
+	if (!ubi_wl_entry_slab) {
+		err = -ENOMEM;
 		goto out_dev_unreg;
+	}
 
 	err = ubi_debugfs_init();
 	if (err)
@@ -1441,11 +1279,15 @@ static int __init ubi_init(void)
 		mtd = open_mtd_device(p->name);
 		if (IS_ERR(mtd)) {
 			err = PTR_ERR(mtd);
-			goto out_detach;
+			ubi_err("cannot open mtd %s, error %d", p->name, err);
+			/* See comment below re-ubi_is_module(). */
+			if (ubi_is_module())
+				goto out_detach;
+			continue;
 		}
 
 		mutex_lock(&ubi_devices_mutex);
-		err = ubi_attach_mtd_dev(mtd, UBI_DEV_NUM_AUTO,
+		err = ubi_attach_mtd_dev(mtd, p->ubi_num,
 					 p->vid_hdr_offs, p->max_beb_per1024);
 		mutex_unlock(&ubi_devices_mutex);
 		if (err < 0) {
@@ -1470,6 +1312,15 @@ static int __init ubi_init(void)
 		}
 	}
 
+	err = ubiblock_init();
+	if (err) {
+		ubi_err("block: cannot initialize, error %d", err);
+
+		/* See comment above re-ubi_is_module(). */
+		if (ubi_is_module())
+			goto out_detach;
+	}
+
 	return 0;
 
 out_detach:
@@ -1489,7 +1340,7 @@ out_version:
 out_class:
 	class_destroy(ubi_class);
 out:
-	ubi_err("UBI error: cannot initialize UBI, error %d", err);
+	ubi_err("cannot initialize UBI, error %d", err);
 	return err;
 }
 late_initcall(ubi_init);
@@ -1497,6 +1348,8 @@ late_initcall(ubi_init);
 static void __exit ubi_exit(void)
 {
 	int i;
+
+	ubiblock_exit();
 
 	for (i = 0; i < UBI_MAX_DEVICES; i++)
 		if (ubi_devices[i]) {
@@ -1526,7 +1379,7 @@ static int __init bytes_str_to_int(const char *str)
 
 	result = simple_strtoul(str, &endp, 0);
 	if (str == endp || result >= INT_MAX) {
-		ubi_err("UBI error: incorrect bytes count: \"%s\"\n", str);
+		ubi_err("incorrect bytes count: \"%s\"\n", str);
 		return -EINVAL;
 	}
 
@@ -1542,7 +1395,7 @@ static int __init bytes_str_to_int(const char *str)
 	case '\0':
 		break;
 	default:
-		ubi_err("UBI error: incorrect bytes count: \"%s\"\n", str);
+		ubi_err("incorrect bytes count: \"%s\"\n", str);
 		return -EINVAL;
 	}
 
@@ -1563,20 +1416,20 @@ static int __init ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
 	struct mtd_dev_param *p;
 	char buf[MTD_PARAM_LEN_MAX];
 	char *pbuf = &buf[0];
-	char *tokens[MTD_PARAM_MAX_COUNT];
+	char *tokens[MTD_PARAM_MAX_COUNT], *token;
 
 	if (!val)
 		return -EINVAL;
 
 	if (mtd_devs == UBI_MAX_DEVICES) {
-		ubi_err("UBI error: too many parameters, max. is %d\n",
+		ubi_err("too many parameters, max. is %d\n",
 			UBI_MAX_DEVICES);
 		return -EINVAL;
 	}
 
 	len = strnlen(val, MTD_PARAM_LEN_MAX);
 	if (len == MTD_PARAM_LEN_MAX) {
-		ubi_err("UBI error: parameter \"%s\" is too long, max. is %d\n",
+		ubi_err("parameter \"%s\" is too long, max. is %d\n",
 			val, MTD_PARAM_LEN_MAX);
 		return -EINVAL;
 	}
@@ -1596,44 +1449,60 @@ static int __init ubi_mtd_param_parse(const char *val, struct kernel_param *kp)
 		tokens[i] = strsep(&pbuf, ",");
 
 	if (pbuf) {
-		ubi_err("UBI error: too many arguments at \"%s\"\n", val);
+		ubi_err("too many arguments at \"%s\"\n", val);
 		return -EINVAL;
 	}
 
 	p = &mtd_dev_param[mtd_devs];
 	strcpy(&p->name[0], tokens[0]);
 
-	if (tokens[1])
-		p->vid_hdr_offs = bytes_str_to_int(tokens[1]);
+	token = tokens[1];
+	if (token) {
+		p->vid_hdr_offs = bytes_str_to_int(token);
 
-	if (p->vid_hdr_offs < 0)
-		return p->vid_hdr_offs;
+		if (p->vid_hdr_offs < 0)
+			return p->vid_hdr_offs;
+	}
 
-	if (tokens[2]) {
-		int err = kstrtoint(tokens[2], 10, &p->max_beb_per1024);
+	token = tokens[2];
+	if (token) {
+		int err = kstrtoint(token, 10, &p->max_beb_per1024);
 
 		if (err) {
-			ubi_err("UBI error: bad value for max_beb_per1024 parameter: %s",
-				tokens[2]);
+			ubi_err("bad value for max_beb_per1024 parameter: %s",
+				token);
 			return -EINVAL;
 		}
 	}
+
+	token = tokens[3];
+	if (token) {
+		int err = kstrtoint(token, 10, &p->ubi_num);
+
+		if (err) {
+			ubi_err("bad value for ubi_num parameter: %s", token);
+			return -EINVAL;
+		}
+	} else
+		p->ubi_num = UBI_DEV_NUM_AUTO;
 
 	mtd_devs += 1;
 	return 0;
 }
 
 module_param_call(mtd, ubi_mtd_param_parse, NULL, NULL, 000);
-MODULE_PARM_DESC(mtd, "MTD devices to attach. Parameter format: mtd=<name|num|path>[,<vid_hdr_offs>[,max_beb_per1024]].\n"
+MODULE_PARM_DESC(mtd, "MTD devices to attach. Parameter format: mtd=<name|num|path>[,<vid_hdr_offs>[,max_beb_per1024[,ubi_num]]].\n"
 		      "Multiple \"mtd\" parameters may be specified.\n"
 		      "MTD devices may be specified by their number, name, or path to the MTD character device node.\n"
 		      "Optional \"vid_hdr_offs\" parameter specifies UBI VID header position to be used by UBI. (default value if 0)\n"
 		      "Optional \"max_beb_per1024\" parameter specifies the maximum expected bad eraseblock per 1024 eraseblocks. (default value ("
 		      __stringify(CONFIG_MTD_UBI_BEB_LIMIT) ") if 0)\n"
+		      "Optional \"ubi_num\" parameter specifies UBI device number which have to be assigned to the newly created UBI device (assigned automatically by default)\n"
 		      "\n"
 		      "Example 1: mtd=/dev/mtd0 - attach MTD device /dev/mtd0.\n"
 		      "Example 2: mtd=content,1984 mtd=4 - attach MTD device with name \"content\" using VID header offset 1984, and MTD device number 4 with default VID header offset.\n"
 		      "Example 3: mtd=/dev/mtd1,0,25 - attach MTD device /dev/mtd1 using default VID header offset and reserve 25*nand_size_in_blocks/1024 erase blocks for bad block handling.\n"
+		      "Example 4: mtd=/dev/mtd1,0,0,5 - attach MTD device /dev/mtd1 to UBI 5 and using default values for the other fields.\n"
 		      "\t(e.g. if the NAND *chipset* has 4096 PEB, 100 will be reserved for this UBI device).");
 #ifdef CONFIG_MTD_UBI_FASTMAP
 module_param(fm_autoconvert, bool, 0644);

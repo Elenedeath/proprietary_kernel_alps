@@ -34,9 +34,7 @@
 #include <asm/sys_ia32.h>
 #include <asm/smap.h>
 
-#define FIX_EFLAGS	__FIX_EFLAGS
-
-int copy_siginfo_to_user32(compat_siginfo_t __user *to, siginfo_t *from)
+int copy_siginfo_to_user32(compat_siginfo_t __user *to, const siginfo_t *from)
 {
 	int err = 0;
 	bool ia32 = test_thread_flag(TIF_IA32);
@@ -155,9 +153,8 @@ int copy_siginfo_from_user32(siginfo_t *to, compat_siginfo_t __user *from)
 } while (0)
 
 #define RELOAD_SEG(seg)		{		\
-	unsigned int pre = GET_SEG(seg);	\
+	unsigned int pre = (seg) | 3;		\
 	unsigned int cur = get_user_seg(seg);	\
-	pre |= 3;				\
 	if (pre != cur)				\
 		set_user_seg(seg, pre);		\
 }
@@ -167,23 +164,18 @@ static int ia32_restore_sigcontext(struct pt_regs *regs,
 				   unsigned int *pax)
 {
 	unsigned int tmpflags, err = 0;
+	u16 gs, fs, es, ds;
 	void __user *buf;
 	u32 tmp;
 
 	/* Always make any pending restarted system calls return -EINTR */
-	current_thread_info()->restart_block.fn = do_no_restart_syscall;
+	current->restart_block.fn = do_no_restart_syscall;
 
 	get_user_try {
-		/*
-		 * Reload fs and gs if they have changed in the signal
-		 * handler.  This does not handle long fs/gs base changes in
-		 * the handler, but does not clobber them at least in the
-		 * normal case.
-		 */
-		RELOAD_SEG(gs);
-		RELOAD_SEG(fs);
-		RELOAD_SEG(ds);
-		RELOAD_SEG(es);
+		gs = GET_SEG(gs);
+		fs = GET_SEG(fs);
+		ds = GET_SEG(ds);
+		es = GET_SEG(es);
 
 		COPY(di); COPY(si); COPY(bp); COPY(sp); COPY(bx);
 		COPY(dx); COPY(cx); COPY(ip);
@@ -202,6 +194,17 @@ static int ia32_restore_sigcontext(struct pt_regs *regs,
 
 		get_user_ex(*pax, &sc->ax);
 	} get_user_catch(err);
+
+	/*
+	 * Reload fs and gs if they have changed in the signal
+	 * handler.  This does not handle long fs/gs base changes in
+	 * the handler, but does not clobber them at least in the
+	 * normal case.
+	 */
+	RELOAD_SEG(gs);
+	RELOAD_SEG(fs);
+	RELOAD_SEG(ds);
+	RELOAD_SEG(es);
 
 	err |= restore_xstate_sig(buf, 1);
 
@@ -385,8 +388,8 @@ int ia32_setup_frame(int sig, struct ksignal *ksig,
 	} else {
 		/* Return stub is in 32bit vsyscall page */
 		if (current->mm->context.vdso)
-			restorer = VDSO32_SYMBOL(current->mm->context.vdso,
-						 sigreturn);
+			restorer = current->mm->context.vdso +
+				selected_vdso32->sym___kernel_sigreturn;
 		else
 			restorer = &frame->retcode;
 	}
@@ -464,8 +467,8 @@ int ia32_setup_rt_frame(int sig, struct ksignal *ksig,
 		if (ksig->ka.sa.sa_flags & SA_RESTORER)
 			restorer = ksig->ka.sa.sa_restorer;
 		else
-			restorer = VDSO32_SYMBOL(current->mm->context.vdso,
-						 rt_sigreturn);
+			restorer = current->mm->context.vdso +
+				selected_vdso32->sym___kernel_rt_sigreturn;
 		put_user_ex(ptr_to_compat(restorer), &frame->pretcode);
 
 		/*

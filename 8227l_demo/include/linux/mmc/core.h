@@ -11,16 +11,9 @@
 #include <linux/interrupt.h>
 #include <linux/completion.h>
 
-#ifdef CONFIG_MTK_EMMC_CACHE
-#define MMC_CACHE_MAX_TIME_OUT (60 * 60 * 1000) //unit of ms 
-//#define MMC_ENABLED_EMPTY_QUEUE_FLUSH
-#endif
-
 struct request;
 struct mmc_data;
 struct mmc_request;
-
-#define CONFIG_EMMC_50_FEATURE
 
 struct mmc_command {
 	u32			opcode;
@@ -102,7 +95,9 @@ struct mmc_command {
  *              actively failing requests
  */
 
-	unsigned int		cmd_timeout_ms;	/* in milliseconds */
+	unsigned int		busy_timeout;	/* busy detect timeout in ms */
+	/* Set this flag only for blocking sanitize request */
+	bool			sanitize_busy;
 
 	struct mmc_data		*data;		/* data segment associated with cmd */
 	struct mmc_request	*mrq;		/* associated request */
@@ -140,6 +135,10 @@ struct mmc_request {
 	struct completion	completion;
 	void			(*done)(struct mmc_request *);/* completion function */
 	struct mmc_host		*host;
+#ifdef CONFIG_BLOCK
+	ktime_t			io_start;
+	int			lat_hist_enabled;
+#endif
 };
 
 struct mmc_card;
@@ -156,7 +155,8 @@ extern int mmc_app_cmd(struct mmc_host *, struct mmc_card *);
 extern int mmc_wait_for_app_cmd(struct mmc_host *, struct mmc_card *,
 	struct mmc_command *, int);
 extern void mmc_start_bkops(struct mmc_card *card, bool from_exception);
-extern int __mmc_switch(struct mmc_card *, u8, u8, u8, unsigned int, bool);
+extern int __mmc_switch(struct mmc_card *, u8, u8, u8, unsigned int, bool,
+			bool, bool);
 extern int mmc_switch(struct mmc_card *, u8, u8, u8, unsigned int);
 extern int mmc_send_ext_csd(struct mmc_card *card, u8 *ext_csd);
 
@@ -193,17 +193,14 @@ extern unsigned int mmc_align_data_size(struct mmc_card *, unsigned int);
 
 extern int __mmc_claim_host(struct mmc_host *host, atomic_t *abort);
 extern void mmc_release_host(struct mmc_host *host);
-extern int mmc_try_claim_host(struct mmc_host *host);
+
+extern void mmc_get_card(struct mmc_card *card);
+extern void mmc_put_card(struct mmc_card *card);
 
 extern int mmc_flush_cache(struct mmc_card *);
 
 extern int mmc_detect_card_removed(struct mmc_host *host);
-#ifdef CONFIG_MTK_EMMC_CACHE
-extern void mmc_start_flush(struct mmc_card *card);
-extern int mmc_stop_flush(struct mmc_card *card);
-extern void mmc_start_delayed_flush(struct mmc_card *card);
-extern void mmc_start_idle_time_flush(struct work_struct *work);
-#endif
+
 /**
  *	mmc_claim_host - exclusively claim a host
  *	@host: mmc host to claim
@@ -215,6 +212,8 @@ static inline void mmc_claim_host(struct mmc_host *host)
 	__mmc_claim_host(host, NULL);
 }
 
+struct device_node;
 extern u32 mmc_vddrange_to_ocrmask(int vdd_min, int vdd_max);
+extern int mmc_of_parse_voltage(struct device_node *np, u32 *mask);
 
 #endif /* LINUX_MMC_CORE_H */

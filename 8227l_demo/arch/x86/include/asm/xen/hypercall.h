@@ -213,6 +213,9 @@ privcmd_call(unsigned call,
 	__HYPERCALL_DECLS;
 	__HYPERCALL_5ARG(a1, a2, a3, a4, a5);
 
+	if (call >= PAGE_SIZE / sizeof(hypercall_page[0]))
+		return -EINVAL;
+
 	asm volatile("call *%[call]"
 		     : __HYPERCALL_5PARAM
 		     : [call] "a" (&hypercall_page[call])
@@ -343,7 +346,7 @@ HYPERVISOR_memory_op(unsigned int cmd, void *arg)
 }
 
 static inline int
-HYPERVISOR_multicall(void *call_list, int nr_calls)
+HYPERVISOR_multicall(void *call_list, uint32_t nr_calls)
 {
 	return _hypercall2(int, multicall, call_list, nr_calls);
 }

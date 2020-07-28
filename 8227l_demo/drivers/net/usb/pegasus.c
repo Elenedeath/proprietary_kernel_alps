@@ -285,7 +285,7 @@ static void mdio_write(struct net_device *dev, int phy_id, int loc, int val)
 static int read_eprom_word(pegasus_t *pegasus, __u8 index, __u16 *retdata)
 {
 	int i;
-	__u8 tmp;
+	__u8 tmp = 0;
 	__le16 retdatai;
 	int ret;
 
@@ -1180,7 +1180,7 @@ static int pegasus_probe(struct usb_interface *intf,
 
 	net->watchdog_timeo = PEGASUS_TX_TIMEOUT;
 	net->netdev_ops = &pegasus_netdev_ops;
-	SET_ETHTOOL_OPS(net, &ops);
+	net->ethtool_ops = &ops;
 	pegasus->mii.dev = net;
 	pegasus->mii.mdio_read = mdio_read;
 	pegasus->mii.mdio_write = mdio_write;

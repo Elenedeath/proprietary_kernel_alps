@@ -1008,7 +1008,7 @@ static int ifx_spi_spi_probe(struct spi_device *spi)
 		return -ENODEV;
 	}
 
-	pl_data = (struct ifx_modem_platform_data *)spi->dev.platform_data;
+	pl_data = dev_get_platdata(&spi->dev);
 	if (!pl_data) {
 		dev_err(&spi->dev, "missing platform data!");
 		return -ENODEV;
@@ -1242,6 +1242,9 @@ static int ifx_spi_spi_remove(struct spi_device *spi)
 	struct ifx_spi_device *ifx_dev = spi_get_drvdata(spi);
 	/* stop activity */
 	tasklet_kill(&ifx_dev->io_work_tasklet);
+
+	pm_runtime_disable(&spi->dev);
+
 	/* free irq */
 	free_irq(gpio_to_irq(ifx_dev->gpio.reset_out), (void *)ifx_dev);
 	free_irq(gpio_to_irq(ifx_dev->gpio.srdy), (void *)ifx_dev);

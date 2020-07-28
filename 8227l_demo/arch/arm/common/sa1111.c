@@ -1060,8 +1060,8 @@ static struct platform_driver sa1111_device_driver = {
 	.remove		= sa1111_remove,
 	.driver		= {
 		.name	= "sa1111",
-		.owner	= THIS_MODULE,
 		.pm	= &sa1111_pm_ops,
+		.owner	= THIS_MODULE,
 	},
 };
 

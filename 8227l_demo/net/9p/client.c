@@ -127,7 +127,7 @@ static int parse_opts(char *opts, struct p9_client *clnt)
 	char *s;
 	int ret = 0;
 
-	clnt->proto_version = p9_proto_2000u;
+	clnt->proto_version = p9_proto_2000L;
 	clnt->msize = 8192;
 
 	if (!opts)
@@ -153,6 +153,12 @@ static int parse_opts(char *opts, struct p9_client *clnt)
 				p9_debug(P9_DEBUG_ERROR,
 					 "integer field, but no integer?\n");
 				ret = r;
+				continue;
+			}
+			if (option < 4096) {
+				p9_debug(P9_DEBUG_ERROR,
+					 "msize should be at least 4k\n");
+				ret = -EINVAL;
 				continue;
 			}
 			clnt->msize = option;
@@ -202,6 +208,17 @@ static int parse_opts(char *opts, struct p9_client *clnt)
 free_and_return:
 	kfree(tmp_options);
 	return ret;
+}
+
+static struct p9_fcall *p9_fcall_alloc(int alloc_msize)
+{
+	struct p9_fcall *fc;
+	fc = kmalloc(sizeof(struct p9_fcall) + alloc_msize, GFP_NOFS);
+	if (!fc)
+		return NULL;
+	fc->capacity = alloc_msize;
+	fc->sdata = (char *) fc + sizeof(struct p9_fcall);
+	return fc;
 }
 
 /**
@@ -256,31 +273,19 @@ p9_tag_alloc(struct p9_client *c, u16 tag, unsigned int max_size)
 	col = tag % P9_ROW_MAXTAG;
 
 	req = &c->reqs[row][col];
-	if (!req->tc) {
+	if (!req->wq) {
 		req->wq = kmalloc(sizeof(wait_queue_head_t), GFP_NOFS);
-		if (!req->wq) {
-			pr_err("Couldn't grow tag array\n");
-			return ERR_PTR(-ENOMEM);
-		}
+		if (!req->wq)
+			goto grow_failed;
 		init_waitqueue_head(req->wq);
-		req->tc = kmalloc(sizeof(struct p9_fcall) + alloc_msize,
-				  GFP_NOFS);
-		req->rc = kmalloc(sizeof(struct p9_fcall) + alloc_msize,
-				  GFP_NOFS);
-		if ((!req->tc) || (!req->rc)) {
-			pr_err("Couldn't grow tag array\n");
-			kfree(req->tc);
-			kfree(req->rc);
-			kfree(req->wq);
-			req->tc = req->rc = NULL;
-			req->wq = NULL;
-			return ERR_PTR(-ENOMEM);
-		}
-		req->tc->capacity = alloc_msize;
-		req->rc->capacity = alloc_msize;
-		req->tc->sdata = (char *) req->tc + sizeof(struct p9_fcall);
-		req->rc->sdata = (char *) req->rc + sizeof(struct p9_fcall);
 	}
+
+	if (!req->tc)
+		req->tc = p9_fcall_alloc(alloc_msize);
+	if (!req->rc)
+		req->rc = p9_fcall_alloc(alloc_msize);
+	if (!req->tc || !req->rc)
+		goto grow_failed;
 
 	p9pdu_reset(req->tc);
 	p9pdu_reset(req->rc);
@@ -288,7 +293,16 @@ p9_tag_alloc(struct p9_client *c, u16 tag, unsigned int max_size)
 	req->tc->tag = tag-1;
 	req->status = REQ_STATUS_ALLOC;
 
-	return &c->reqs[row][col];
+	return req;
+
+grow_failed:
+	pr_err("Couldn't grow tag array\n");
+	kfree(req->tc);
+	kfree(req->rc);
+	kfree(req->wq);
+	req->tc = req->rc = NULL;
+	req->wq = NULL;
+	return ERR_PTR(-ENOMEM);
 }
 
 /**
@@ -407,9 +421,17 @@ static void p9_free_req(struct p9_client *c, struct p9_req_t *r)
  * req: request received
  *
  */
-void p9_client_cb(struct p9_client *c, struct p9_req_t *req)
+void p9_client_cb(struct p9_client *c, struct p9_req_t *req, int status)
 {
 	p9_debug(P9_DEBUG_MUX, " tag %d\n", req->tc->tag);
+
+	/*
+	 * This barrier is needed to make sure any change made to req before
+	 * the other thread wakes up will indeed be seen by the waiting side.
+	 */
+	smp_wmb();
+	req->status = status;
+
 	wake_up(req->wq);
 	p9_debug(P9_DEBUG_MUX, "wakeup: %d\n", req->tc->tag);
 }
@@ -647,13 +669,13 @@ static int p9_client_flush(struct p9_client *c, struct p9_req_t *oldreq)
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
-
-	/* if we haven't received a response for oldreq,
-	   remove it from the list. */
-	spin_lock(&c->lock);
-	if (oldreq->status == REQ_STATUS_FLSH)
-		list_del(&oldreq->req_list);
-	spin_unlock(&c->lock);
+	/*
+	 * if we haven't received a response for oldreq,
+	 * remove it from the list
+	 */
+	if (oldreq->status == REQ_STATUS_SENT)
+		if (c->trans_mod->cancelled)
+			c->trans_mod->cancelled(c, oldreq);
 
 	p9_free_req(c, req);
 	return 0;
@@ -737,8 +759,13 @@ p9_client_rpc(struct p9_client *c, int8_t type, const char *fmt, ...)
 	}
 again:
 	/* Wait for the response */
-	err = wait_event_interruptible(*req->wq,
-				       req->status >= REQ_STATUS_RCVD);
+	err = wait_event_killable(*req->wq, req->status >= REQ_STATUS_RCVD);
+
+	/*
+	 * Make sure our req is coherent with regard to updates in other
+	 * threads - echoes to wmb() in the callback
+	 */
+	smp_rmb();
 
 	if ((err == -ERESTARTSYS) && (c->status == Connected)
 				  && (type == P9_TFLUSH)) {
@@ -917,7 +944,7 @@ static int p9_client_version(struct p9_client *c)
 {
 	int err = 0;
 	struct p9_req_t *req;
-	char *version;
+	char *version = NULL;
 	int msize;
 
 	p9_debug(P9_DEBUG_9P, ">>> TVERSION msize %d protocol %d\n",
@@ -938,7 +965,6 @@ static int p9_client_version(struct p9_client *c)
 		break;
 	default:
 		return -EINVAL;
-		break;
 	}
 
 	if (IS_ERR(req))
@@ -959,10 +985,18 @@ static int p9_client_version(struct p9_client *c)
 	else if (!strncmp(version, "9P2000", 6))
 		c->proto_version = p9_proto_legacy;
 	else {
+		p9_debug(P9_DEBUG_ERROR,
+			 "server returned an unknown version: %s\n", version);
 		err = -EREMOTEIO;
 		goto error;
 	}
 
+	if (msize < 4096) {
+		p9_debug(P9_DEBUG_ERROR,
+			 "server returned a msize < 4096: %d\n", msize);
+		err = -EREMOTEIO;
+		goto error;
+	}
 	if (msize < c->msize)
 		c->msize = msize;
 
@@ -977,6 +1011,7 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 {
 	int err;
 	struct p9_client *clnt;
+	char *client_id;
 
 	err = 0;
 	clnt = kmalloc(sizeof(struct p9_client), GFP_KERNEL);
@@ -985,6 +1020,10 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 
 	clnt->trans_mod = NULL;
 	clnt->trans = NULL;
+
+	client_id = utsname()->nodename;
+	memcpy(clnt->name, client_id, strlen(client_id) + 1);
+
 	spin_lock_init(&clnt->lock);
 	INIT_LIST_HEAD(&clnt->fidlist);
 
@@ -1021,6 +1060,13 @@ struct p9_client *p9_client_create(const char *dev_name, char *options)
 
 	if (clnt->msize > clnt->trans_mod->maxsize)
 		clnt->msize = clnt->trans_mod->maxsize;
+
+	if (clnt->msize < 4096) {
+		p9_debug(P9_DEBUG_ERROR,
+			 "Please specify a msize of at least 4k\n");
+		err = -EINVAL;
+		goto close_trans;
+	}
 
 	err = p9_client_version(clnt);
 	if (err)

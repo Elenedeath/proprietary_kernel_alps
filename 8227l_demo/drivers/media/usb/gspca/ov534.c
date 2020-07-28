@@ -642,6 +642,11 @@ static u8 ov534_reg_read(struct gspca_dev *gspca_dev, u16 reg)
 	if (ret < 0) {
 		pr_err("read failed %d\n", ret);
 		gspca_dev->usb_err = ret;
+		/*
+		 * Make sure the result is zeroed to avoid uninitialized
+		 * values.
+		 */
+		gspca_dev->usb_buf[0] = 0;
 	}
 	return gspca_dev->usb_buf[0];
 }
@@ -1305,8 +1310,7 @@ static int sd_init(struct gspca_dev *gspca_dev)
 	ov534_set_led(gspca_dev, 1);
 	sccb_w_array(gspca_dev, sensor_init[sd->sensor].val,
 			sensor_init[sd->sensor].len);
-	if (sd->sensor == SENSOR_OV767x)
-		sd_start(gspca_dev);
+
 	sd_stopN(gspca_dev);
 /*	set_frame_rate(gspca_dev);	*/
 
@@ -1441,9 +1445,10 @@ static void sd_pkt_scan(struct gspca_dev *gspca_dev,
 		/* If this packet is marked as EOF, end the frame */
 		} else if (data[1] & UVC_STREAM_EOF) {
 			sd->last_pts = 0;
-			if (gspca_dev->pixfmt == V4L2_PIX_FMT_YUYV
+			if (gspca_dev->pixfmt.pixelformat == V4L2_PIX_FMT_YUYV
 			 && gspca_dev->image_len + len - 12 !=
-				   gspca_dev->width * gspca_dev->height * 2) {
+				   gspca_dev->pixfmt.width *
+					gspca_dev->pixfmt.height * 2) {
 				PDEBUG(D_PACK, "wrong sized frame");
 				goto discard;
 			}

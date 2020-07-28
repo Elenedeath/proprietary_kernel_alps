@@ -15,9 +15,9 @@
 
 #include <linux/workqueue.h>
 #include <linux/leds.h>
+#include <linux/spinlock.h>
+#include <linux/notifier.h>
 #include <linux/types.h>
-
-struct device;
 
 /*
  * All voltages, currents, charges, energies, time and temperatures in uV,
@@ -38,7 +38,6 @@ enum {
 	POWER_SUPPLY_STATUS_DISCHARGING,
 	POWER_SUPPLY_STATUS_NOT_CHARGING,
 	POWER_SUPPLY_STATUS_FULL,
-	POWER_SUPPLY_STATUS_CMD_DISCHARGING,
 };
 
 enum {
@@ -102,9 +101,11 @@ enum power_supply_property {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_AVG,
 	POWER_SUPPLY_PROP_VOLTAGE_OCV,
+	POWER_SUPPLY_PROP_VOLTAGE_BOOT,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_AVG,
+	POWER_SUPPLY_PROP_CURRENT_BOOT,
 	POWER_SUPPLY_PROP_POWER_NOW,
 	POWER_SUPPLY_PROP_POWER_AVG,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
@@ -120,6 +121,7 @@ enum power_supply_property {
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
 	POWER_SUPPLY_PROP_ENERGY_EMPTY_DESIGN,
 	POWER_SUPPLY_PROP_ENERGY_FULL,
@@ -131,6 +133,8 @@ enum power_supply_property {
 	POWER_SUPPLY_PROP_CAPACITY_ALERT_MAX, /* in percents! */
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_TEMP_MAX,
+	POWER_SUPPLY_PROP_TEMP_MIN,
 	POWER_SUPPLY_PROP_TEMP_ALERT_MIN,
 	POWER_SUPPLY_PROP_TEMP_ALERT_MAX,
 	POWER_SUPPLY_PROP_TEMP_AMBIENT,
@@ -142,29 +146,14 @@ enum power_supply_property {
 	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
 	POWER_SUPPLY_PROP_TYPE, /* use power_supply.type instead */
 	POWER_SUPPLY_PROP_SCOPE,
+	POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT,
+	POWER_SUPPLY_PROP_CALIBRATE,
 	/* Local extensions */
 	POWER_SUPPLY_PROP_USB_HC,
 	POWER_SUPPLY_PROP_USB_OTG,
 	POWER_SUPPLY_PROP_CHARGE_ENABLED,
 	/* Local extensions of type int64_t */
 	POWER_SUPPLY_PROP_CHARGE_COUNTER_EXT,
-	/* 20100723 James Lo */
-	POWER_SUPPLY_PROP_batt_vol,
-	POWER_SUPPLY_PROP_batt_temp,
-	/* 20100723 Add for EM */
-	POWER_SUPPLY_PROP_TemperatureR,
-	POWER_SUPPLY_PROP_TempBattVoltage,
-	POWER_SUPPLY_PROP_InstatVolt,
-	POWER_SUPPLY_PROP_BatteryAverageCurrent,
-	POWER_SUPPLY_PROP_BatterySenseVoltage,
-	POWER_SUPPLY_PROP_ISenseVoltage,
-	POWER_SUPPLY_PROP_ChargerVoltage,
-	/* Dual battery */
-	POWER_SUPPLY_PROP_status_smb,
-	POWER_SUPPLY_PROP_capacity_smb,
-	POWER_SUPPLY_PROP_present_smb,
-	/* ADB CMD Discharging */
-	POWER_SUPPLY_PROP_adjust_power,
 	/* Properties of type `const char *' */
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_MANUFACTURER,
@@ -180,7 +169,10 @@ enum power_supply_type {
 	POWER_SUPPLY_TYPE_USB_DCP,	/* Dedicated Charging Port */
 	POWER_SUPPLY_TYPE_USB_CDP,	/* Charging Downstream Port */
 	POWER_SUPPLY_TYPE_USB_ACA,	/* Accessory Charger Adapters */
-	POWER_SUPPLY_TYPE_WIRELESS,	/* Wireless Charger */
+};
+
+enum power_supply_notifier_events {
+	PSY_EVENT_PROP_CHANGED,
 };
 
 union power_supply_propval {
@@ -188,6 +180,9 @@ union power_supply_propval {
 	const char *strval;
 	int64_t int64val;
 };
+
+struct device;
+struct device_node;
 
 struct power_supply {
 	const char *name;
@@ -200,9 +195,7 @@ struct power_supply {
 
 	char **supplied_from;
 	size_t num_supplies;
-#ifdef CONFIG_OF
 	struct device_node *of_node;
-#endif
 
 	int (*get_property)(struct power_supply *psy,
 			    enum power_supply_property psp,
@@ -215,6 +208,12 @@ struct power_supply {
 	void (*external_power_changed)(struct power_supply *psy);
 	void (*set_charged)(struct power_supply *psy);
 
+	/*
+	 * Set if thermal zone should not be created for this power supply.
+	 * For example for virtual supplies forwarding calls to actual
+	 * sensors or other supplies.
+	 */
+	bool no_thermal;
 	/* For APM emulation, think legacy userspace. */
 	int use_for_apm;
 
@@ -261,7 +260,18 @@ struct power_supply_info {
 	int use_for_apm;
 };
 
+extern struct atomic_notifier_head power_supply_notifier;
+extern int power_supply_reg_notifier(struct notifier_block *nb);
+extern void power_supply_unreg_notifier(struct notifier_block *nb);
 extern struct power_supply *power_supply_get_by_name(const char *name);
+#ifdef CONFIG_OF
+extern struct power_supply *power_supply_get_by_phandle(struct device_node *np,
+							const char *property);
+#else /* !CONFIG_OF */
+static inline struct power_supply *
+power_supply_get_by_phandle(struct device_node *np, const char *property)
+{ return NULL; }
+#endif /* CONFIG_OF */
 extern void power_supply_changed(struct power_supply *psy);
 extern int power_supply_am_i_supplied(struct power_supply *psy);
 extern int power_supply_set_battery_charged(struct power_supply *psy);
@@ -273,6 +283,8 @@ static inline int power_supply_is_system_supplied(void) { return -ENOSYS; }
 #endif
 
 extern int power_supply_register(struct device *parent,
+				 struct power_supply *psy);
+extern int power_supply_register_no_ws(struct device *parent,
 				 struct power_supply *psy);
 extern void power_supply_unregister(struct power_supply *psy);
 extern int power_supply_powers(struct power_supply *psy, struct device *dev);
@@ -295,6 +307,7 @@ static inline bool power_supply_is_amp_property(enum power_supply_property psp)
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 	case POWER_SUPPLY_PROP_CURRENT_AVG:
+	case POWER_SUPPLY_PROP_CURRENT_BOOT:
 		return 1;
 	default:
 		break;
@@ -319,6 +332,7 @@ static inline bool power_supply_is_watt_property(enum power_supply_property psp)
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
 	case POWER_SUPPLY_PROP_VOLTAGE_AVG:
 	case POWER_SUPPLY_PROP_VOLTAGE_OCV:
+	case POWER_SUPPLY_PROP_VOLTAGE_BOOT:
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX:
 	case POWER_SUPPLY_PROP_POWER_NOW:

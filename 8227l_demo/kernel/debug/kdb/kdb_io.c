@@ -57,7 +57,6 @@ static int kdb_read_get_key(char *buffer, size_t bufsize)
 	int escape_delay = 0;
 	get_char_func *f, *f_escape = NULL;
 	int key;
-	unsigned long long duration = 0;
 
 	for (f = &kdb_poll_funcs[0]; ; ++f) {
 		if (*f == NULL) {
@@ -81,17 +80,6 @@ static int kdb_read_get_key(char *buffer, size_t bufsize)
 			if (escape_delay) {
 				udelay(ESCAPE_UDELAY);
 				--escape_delay;
-			}
-			/* check timeout and force trigger kernel panic */
-			if (check_timeout) {
-				duration = sched_clock() - enter_time;
-				do_div(duration, 1000000000ULL);
-				if (duration > KE_TIMEOUT_SEC) {
-					kdb_printf("\nKDB timeout! No user input. \n");
-					strcpy(buffer, "go");
-					force_panic = 1;
-					return -1;
-				}
 			}
 			continue;
 		}
@@ -178,12 +166,6 @@ static int kdb_read_get_key(char *buffer, size_t bufsize)
 		}
 		break;	/* A key to process */
 	}
-
-	if (check_timeout) {
-		kdb_printf("\nUser input! \n");
-		check_timeout = 0;
-	}
-
 	return key;
 }
 
@@ -233,7 +215,7 @@ static char *kdb_read(char *buffer, size_t bufsize)
 	int count;
 	int i;
 	int diag, dtab_count;
-	int key;
+	int key, buf_size, ret;
 	static int last_crlf;
 
 	diag = kdbgetintenv("DTABCOUNT", &dtab_count);
@@ -361,9 +343,8 @@ poll_again:
 		else
 			p_tmp = tmpbuffer;
 		len = strlen(p_tmp);
-		count = kallsyms_symbol_complete(p_tmp,
-						 sizeof(tmpbuffer) -
-						 (p_tmp - tmpbuffer));
+		buf_size = sizeof(tmpbuffer) - (p_tmp - tmpbuffer);
+		count = kallsyms_symbol_complete(p_tmp, buf_size);
 		if (tab == 2 && count > 0) {
 			kdb_printf("\n%d symbols are found.", count);
 			if (count > dtab_count) {
@@ -375,9 +356,13 @@ poll_again:
 			}
 			kdb_printf("\n");
 			for (i = 0; i < count; i++) {
-				if (kallsyms_symbol_next(p_tmp, i) < 0)
+				ret = kallsyms_symbol_next(p_tmp, i, buf_size);
+				if (WARN_ON(!ret))
 					break;
-				kdb_printf("%s ", p_tmp);
+				if (ret != -E2BIG)
+					kdb_printf("%s ", p_tmp);
+				else
+					kdb_printf("%s... ", p_tmp);
 				*(p_tmp + len) = '\0';
 			}
 			if (i >= dtab_count)
@@ -736,7 +721,7 @@ kdb_printit:
 	}
 	if (logging) {
 		saved_loglevel = console_loglevel;
-		console_loglevel = 0;
+		console_loglevel = CONSOLE_LOGLEVEL_SILENT;
 		printk(KERN_INFO "%s", kdb_buffer);
 	}
 

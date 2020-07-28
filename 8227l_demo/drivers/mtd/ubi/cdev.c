@@ -138,13 +138,13 @@ static int vol_cdev_release(struct inode *inode, struct file *file)
 			 vol->vol_id);
 		ubi_assert(!vol->changing_leb);
 		vol->updating = 0;
-		kfree(vol->upd_buf);
+		vfree(vol->upd_buf);
 	} else if (vol->changing_leb) {
 		dbg_gen("only %lld of %lld bytes received for atomic LEB change for volume %d:%d, cancel",
 			vol->upd_received, vol->upd_bytes, vol->ubi->ubi_num,
 			vol->vol_id);
 		vol->changing_leb = 0;
-		kfree(vol->upd_buf);
+		vfree(vol->upd_buf);
 	}
 
 	ubi_close_volume(desc);
@@ -155,7 +155,6 @@ static loff_t vol_cdev_llseek(struct file *file, loff_t offset, int origin)
 {
 	struct ubi_volume_desc *desc = file->private_data;
 	struct ubi_volume *vol = desc->vol;
-	loff_t new_offset;
 
 	if (vol->updating) {
 		/* Update is in progress, seeking is prohibited */
@@ -163,30 +162,7 @@ static loff_t vol_cdev_llseek(struct file *file, loff_t offset, int origin)
 		return -EBUSY;
 	}
 
-	switch (origin) {
-	case 0: /* SEEK_SET */
-		new_offset = offset;
-		break;
-	case 1: /* SEEK_CUR */
-		new_offset = file->f_pos + offset;
-		break;
-	case 2: /* SEEK_END */
-		new_offset = vol->used_bytes + offset;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (new_offset < 0 || new_offset > vol->used_bytes) {
-		ubi_err("bad seek %lld", new_offset);
-		return -EINVAL;
-	}
-
-	dbg_gen("seek volume %d, offset %lld, origin %d, new offset %lld",
-		vol->vol_id, offset, origin, new_offset);
-
-	file->f_pos = new_offset;
-	return new_offset;
+	return fixed_size_llseek(file, offset, origin, vol->used_bytes);
 }
 
 static int vol_cdev_fsync(struct file *file, loff_t start, loff_t end,
@@ -236,7 +212,7 @@ static ssize_t vol_cdev_read(struct file *file, __user char *buf, size_t count,
 	tbuf_size = vol->usable_leb_size;
 	if (count < tbuf_size)
 		tbuf_size = ALIGN(count, ubi->min_io_size);
-	tbuf = kmalloc(tbuf_size, GFP_KERNEL);
+	tbuf = vmalloc(tbuf_size);
 	if (!tbuf)
 		return -ENOMEM;
 
@@ -272,7 +248,7 @@ static ssize_t vol_cdev_read(struct file *file, __user char *buf, size_t count,
 		len = count > tbuf_size ? tbuf_size : count;
 	} while (count);
 
-	kfree(tbuf);
+	vfree(tbuf);
 	return err ? err : count_save - count;
 }
 
@@ -317,7 +293,7 @@ static ssize_t vol_cdev_direct_write(struct file *file, const char __user *buf,
 	tbuf_size = vol->usable_leb_size;
 	if (count < tbuf_size)
 		tbuf_size = ALIGN(count, ubi->min_io_size);
-	tbuf = kmalloc(tbuf_size, GFP_KERNEL);
+	tbuf = vmalloc(tbuf_size);
 	if (!tbuf)
 		return -ENOMEM;
 
@@ -351,7 +327,7 @@ static ssize_t vol_cdev_direct_write(struct file *file, const char __user *buf,
 		len = count > tbuf_size ? tbuf_size : count;
 	}
 
-	kfree(tbuf);
+	vfree(tbuf);
 	return err ? err : count_save - count;
 }
 
@@ -413,7 +389,6 @@ static long vol_cdev_ioctl(struct file *file, unsigned int cmd,
 	struct ubi_volume_desc *desc = file->private_data;
 	struct ubi_volume *vol = desc->vol;
 	struct ubi_device *ubi = vol->ubi;
-
 	void __user *argp = (void __user *)arg;
 
 	switch (cmd) {
@@ -421,9 +396,7 @@ static long vol_cdev_ioctl(struct file *file, unsigned int cmd,
 	case UBI_IOCVOLUP:
 	{
 		int64_t bytes, rsvd_bytes;
-        #if CONFIG_BLB
-        struct ubi_volume *backup_vol = ubi->volumes[vol_id2idx(ubi, UBI_BACKUP_VOLUME_ID)];
-        #endif
+
 		if (!capable(CAP_SYS_RESOURCE)) {
 			err = -EPERM;
 			break;
@@ -452,12 +425,10 @@ static long vol_cdev_ioctl(struct file *file, unsigned int cmd,
 			break;
 
 		err = ubi_start_update(ubi, vol, bytes);
-		if (bytes == 0)
+		if (bytes == 0) {
+			ubi_volume_notify(ubi, vol, UBI_VOLUME_UPDATED);
 			revoke_exclusive(desc, UBI_READWRITE);
-		#if CONFIG_BLB
-        ubi_eba_unmap_leb(ubi, backup_vol, 0);
-        ubi_eba_unmap_leb(ubi, backup_vol, 1);
-		#endif
+		}
 		break;
 	}
 
@@ -550,13 +521,7 @@ static long vol_cdev_ioctl(struct file *file, unsigned int cmd,
 			err = -EFAULT;
 			break;
 		}
-#ifdef MTK_IPOH_SUPPORT
-		ubi->ipoh_ops = 1;
-#endif
 		err = ubi_leb_unmap(desc, lnum);
-#ifdef MTK_IPOH_SUPPORT
-		ubi->ipoh_ops = 0;
-#endif
 		break;
 	}
 
@@ -597,22 +562,27 @@ static long vol_cdev_ioctl(struct file *file, unsigned int cmd,
 		}
 		break;
 	}
-	case UBI_IOCLBMAP:
+
+	/* Create a R/O block device on top of the UBI volume */
+	case UBI_IOCVOLCRBLK:
 	{
-		int LEB[2];
-		err = copy_from_user(LEB, argp, sizeof(int)*2);
-                if (err) {
-                        err = -EFAULT;
-                        break;
-                }
-		LEB[1] = desc->vol->eba_tbl[LEB[0]];
-		err = copy_to_user(argp, LEB, sizeof(int)*2);
-                if (err) {
-                        err = -EFAULT;
-                        break;
-		}
+		struct ubi_volume_info vi;
+
+		ubi_get_volume_info(desc, &vi);
+		err = ubiblock_create(&vi);
 		break;
 	}
+
+	/* Remove the R/O block device */
+	case UBI_IOCVOLRMBLK:
+	{
+		struct ubi_volume_info vi;
+
+		ubi_get_volume_info(desc, &vi);
+		err = ubiblock_remove(&vi);
+		break;
+	}
+
 	default:
 		err = -ENOTTY;
 		break;
@@ -731,7 +701,7 @@ static int rename_volumes(struct ubi_device *ubi,
 		req->ents[i].name[req->ents[i].name_len] = '\0';
 		n = strlen(req->ents[i].name);
 		if (n != req->ents[i].name_len)
-			err = -EINVAL;
+			return -EINVAL;
 	}
 
 	/* Make sure volume IDs and names are unique */
@@ -763,7 +733,7 @@ static int rename_volumes(struct ubi_device *ubi,
 			goto out_free;
 		}
 
-		re->desc = ubi_open_volume(ubi->ubi_num, vol_id, UBI_EXCLUSIVE);
+		re->desc = ubi_open_volume(ubi->ubi_num, vol_id, UBI_READWRITE);
 		if (IS_ERR(re->desc)) {
 			err = PTR_ERR(re->desc);
 			ubi_err("cannot open volume %d, error %d", vol_id, err);

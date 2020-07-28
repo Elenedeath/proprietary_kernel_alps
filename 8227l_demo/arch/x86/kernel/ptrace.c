@@ -184,14 +184,14 @@ unsigned long kernel_stack_pointer(struct pt_regs *regs)
 {
 	unsigned long context = (unsigned long)regs & ~(THREAD_SIZE - 1);
 	unsigned long sp = (unsigned long)&regs->sp;
-	struct thread_info *tinfo;
+	u32 *prev_esp;
 
 	if (context == (sp & ~(THREAD_SIZE - 1)))
 		return sp;
 
-	tinfo = (struct thread_info *)context;
-	if (tinfo->previous_esp)
-		return tinfo->previous_esp;
+	prev_esp = (u32 *)(context);
+	if (*prev_esp)
+		return (unsigned long)*prev_esp;
 
 	return (unsigned long)regs;
 }
@@ -601,30 +601,48 @@ static unsigned long ptrace_get_dr7(struct perf_event *bp[])
 	return dr7;
 }
 
-static int
-ptrace_modify_breakpoint(struct perf_event *bp, int len, int type,
-			 struct task_struct *tsk, int disabled)
+static int ptrace_fill_bp_fields(struct perf_event_attr *attr,
+					int len, int type, bool disabled)
 {
-	int err;
-	int gen_len, gen_type;
+	int err, bp_len, bp_type;
+
+	err = arch_bp_generic_fields(len, type, &bp_len, &bp_type);
+	if (!err) {
+		attr->bp_len = bp_len;
+		attr->bp_type = bp_type;
+		attr->disabled = disabled;
+	}
+
+	return err;
+}
+
+static struct perf_event *
+ptrace_register_breakpoint(struct task_struct *tsk, int len, int type,
+				unsigned long addr, bool disabled)
+{
 	struct perf_event_attr attr;
+	int err;
 
-	/*
-	 * We should have at least an inactive breakpoint at this
-	 * slot. It means the user is writing dr7 without having
-	 * written the address register first
-	 */
-	if (!bp)
-		return -EINVAL;
+	ptrace_breakpoint_init(&attr);
+	attr.bp_addr = addr;
 
-	err = arch_bp_generic_fields(len, type, &gen_len, &gen_type);
+	err = ptrace_fill_bp_fields(&attr, len, type, disabled);
+	if (err)
+		return ERR_PTR(err);
+
+	return register_user_hw_breakpoint(&attr, ptrace_triggered,
+						 NULL, tsk);
+}
+
+static int ptrace_modify_breakpoint(struct perf_event *bp, int len, int type,
+					int disabled)
+{
+	struct perf_event_attr attr = bp->attr;
+	int err;
+
+	err = ptrace_fill_bp_fields(&attr, len, type, disabled);
 	if (err)
 		return err;
-
-	attr = bp->attr;
-	attr.bp_len = gen_len;
-	attr.bp_type = gen_type;
-	attr.disabled = disabled;
 
 	return modify_user_hw_breakpoint(bp, &attr);
 }
@@ -634,67 +652,50 @@ ptrace_modify_breakpoint(struct perf_event *bp, int len, int type,
  */
 static int ptrace_write_dr7(struct task_struct *tsk, unsigned long data)
 {
-	struct thread_struct *thread = &(tsk->thread);
+	struct thread_struct *thread = &tsk->thread;
 	unsigned long old_dr7;
-	int i, orig_ret = 0, rc = 0;
-	int enabled, second_pass = 0;
-	unsigned len, type;
-	struct perf_event *bp;
-
-	if (ptrace_get_breakpoints(tsk) < 0)
-		return -ESRCH;
+	bool second_pass = false;
+	int i, rc, ret = 0;
 
 	data &= ~DR_CONTROL_RESERVED;
 	old_dr7 = ptrace_get_dr7(thread->ptrace_bps);
+
 restore:
-	/*
-	 * Loop through all the hardware breakpoints, making the
-	 * appropriate changes to each.
-	 */
+	rc = 0;
 	for (i = 0; i < HBP_NUM; i++) {
-		enabled = decode_dr7(data, i, &len, &type);
-		bp = thread->ptrace_bps[i];
+		unsigned len, type;
+		bool disabled = !decode_dr7(data, i, &len, &type);
+		struct perf_event *bp = thread->ptrace_bps[i];
 
-		if (!enabled) {
-			if (bp) {
-				/*
-				 * Don't unregister the breakpoints right-away,
-				 * unless all register_user_hw_breakpoint()
-				 * requests have succeeded. This prevents
-				 * any window of opportunity for debug
-				 * register grabbing by other users.
-				 */
-				if (!second_pass)
-					continue;
+		if (!bp) {
+			if (disabled)
+				continue;
 
-				rc = ptrace_modify_breakpoint(bp, len, type,
-							      tsk, 1);
-				if (rc)
-					break;
+			bp = ptrace_register_breakpoint(tsk,
+					len, type, 0, disabled);
+			if (IS_ERR(bp)) {
+				rc = PTR_ERR(bp);
+				break;
 			}
+
+			thread->ptrace_bps[i] = bp;
 			continue;
 		}
 
-		rc = ptrace_modify_breakpoint(bp, len, type, tsk, 0);
+		rc = ptrace_modify_breakpoint(bp, len, type, disabled);
 		if (rc)
 			break;
 	}
-	/*
-	 * Make a second pass to free the remaining unused breakpoints
-	 * or to restore the original breakpoints if an error occurred.
-	 */
-	if (!second_pass) {
-		second_pass = 1;
-		if (rc < 0) {
-			orig_ret = rc;
-			data = old_dr7;
-		}
+
+	/* Restore if the first pass failed, second_pass shouldn't fail. */
+	if (rc && !WARN_ON(second_pass)) {
+		ret = rc;
+		data = old_dr7;
+		second_pass = true;
 		goto restore;
 	}
 
-	ptrace_put_breakpoints(tsk);
-
-	return ((orig_ret < 0) ? orig_ret : rc);
+	return ret;
 }
 
 /*
@@ -702,25 +703,17 @@ restore:
  */
 static unsigned long ptrace_get_debugreg(struct task_struct *tsk, int n)
 {
-	struct thread_struct *thread = &(tsk->thread);
+	struct thread_struct *thread = &tsk->thread;
 	unsigned long val = 0;
 
 	if (n < HBP_NUM) {
-		struct perf_event *bp;
+		struct perf_event *bp = thread->ptrace_bps[n];
 
-		if (ptrace_get_breakpoints(tsk) < 0)
-			return -ESRCH;
-
-		bp = thread->ptrace_bps[n];
-		if (!bp)
-			val = 0;
-		else
+		if (bp)
 			val = bp->hw.info.address;
-
-		ptrace_put_breakpoints(tsk);
 	} else if (n == 6) {
 		val = thread->debugreg6;
-	 } else if (n == 7) {
+	} else if (n == 7) {
 		val = thread->ptrace_dr7;
 	}
 	return val;
@@ -729,29 +722,14 @@ static unsigned long ptrace_get_debugreg(struct task_struct *tsk, int n)
 static int ptrace_set_breakpoint_addr(struct task_struct *tsk, int nr,
 				      unsigned long addr)
 {
-	struct perf_event *bp;
 	struct thread_struct *t = &tsk->thread;
-	struct perf_event_attr attr;
+	struct perf_event *bp = t->ptrace_bps[nr];
 	int err = 0;
 
-	if (ptrace_get_breakpoints(tsk) < 0)
-		return -ESRCH;
-
-	if (!t->ptrace_bps[nr]) {
-		ptrace_breakpoint_init(&attr);
+	if (!bp) {
 		/*
-		 * Put stub len and type to register (reserve) an inactive but
-		 * correct bp
-		 */
-		attr.bp_addr = addr;
-		attr.bp_len = HW_BREAKPOINT_LEN_1;
-		attr.bp_type = HW_BREAKPOINT_W;
-		attr.disabled = 1;
-
-		bp = register_user_hw_breakpoint(&attr, ptrace_triggered,
-						 NULL, tsk);
-
-		/*
+		 * Put stub len and type to create an inactive but correct bp.
+		 *
 		 * CHECKME: the previous code returned -EIO if the addr wasn't
 		 * a valid task virtual addr. The new one will return -EINVAL in
 		 *  this case.
@@ -760,22 +738,20 @@ static int ptrace_set_breakpoint_addr(struct task_struct *tsk, int nr,
 		 * writing for the user. And anyway this is the previous
 		 * behaviour.
 		 */
-		if (IS_ERR(bp)) {
+		bp = ptrace_register_breakpoint(tsk,
+				X86_BREAKPOINT_LEN_1, X86_BREAKPOINT_WRITE,
+				addr, true);
+		if (IS_ERR(bp))
 			err = PTR_ERR(bp);
-			goto put;
-		}
-
-		t->ptrace_bps[nr] = bp;
+		else
+			t->ptrace_bps[nr] = bp;
 	} else {
-		bp = t->ptrace_bps[nr];
+		struct perf_event_attr attr = bp->attr;
 
-		attr = bp->attr;
 		attr.bp_addr = addr;
 		err = modify_user_hw_breakpoint(bp, &attr);
 	}
 
-put:
-	ptrace_put_breakpoints(tsk);
 	return err;
 }
 
@@ -785,30 +761,20 @@ put:
 static int ptrace_set_debugreg(struct task_struct *tsk, int n,
 			       unsigned long val)
 {
-	struct thread_struct *thread = &(tsk->thread);
-	int rc = 0;
-
+	struct thread_struct *thread = &tsk->thread;
 	/* There are no DR4 or DR5 registers */
-	if (n == 4 || n == 5)
-		return -EIO;
+	int rc = -EIO;
 
-	if (n == 6) {
-		thread->debugreg6 = val;
-		goto ret_path;
-	}
 	if (n < HBP_NUM) {
 		rc = ptrace_set_breakpoint_addr(tsk, n, val);
-		if (rc)
-			return rc;
-	}
-	/* All that's left is DR7 */
-	if (n == 7) {
+	} else if (n == 6) {
+		thread->debugreg6 = val;
+		rc = 0;
+	} else if (n == 7) {
 		rc = ptrace_write_dr7(tsk, val);
 		if (!rc)
 			thread->ptrace_dr7 = val;
 	}
-
-ret_path:
 	return rc;
 }
 
@@ -1475,15 +1441,45 @@ void send_sigtrap(struct task_struct *tsk, struct pt_regs *regs,
 	force_sig_info(SIGTRAP, &info, tsk);
 }
 
+static void do_audit_syscall_entry(struct pt_regs *regs, u32 arch)
+{
+#ifdef CONFIG_X86_64
+	if (arch == AUDIT_ARCH_X86_64) {
+		audit_syscall_entry(regs->orig_ax, regs->di,
+				    regs->si, regs->dx, regs->r10);
+	} else
+#endif
+	{
+		audit_syscall_entry(regs->orig_ax, regs->bx,
+				    regs->cx, regs->dx, regs->si);
+	}
+}
+
 /*
- * We must return the syscall number to actually look up in the table.
- * This can be -1L to skip running any syscall at all.
+ * Returns the syscall nr to run (which should match regs->orig_ax) or -1
+ * to skip the syscall.
  */
 long syscall_trace_enter(struct pt_regs *regs)
 {
-	long ret = 0;
+	u32 arch = is_ia32_task() ? AUDIT_ARCH_I386 : AUDIT_ARCH_X86_64;
 
-	user_exit();
+	unsigned long ret = 0;
+	bool emulated = false;
+	u32 work;
+
+	BUG_ON(regs != task_pt_regs(current));
+
+	work = ACCESS_ONCE(current_thread_info()->flags) &
+		_TIF_WORK_SYSCALL_ENTRY;
+
+	/*
+	 * If TIF_NOHZ is set, we are required to call user_exit() before
+	 * doing anything that could touch RCU.
+	 */
+	if (work & _TIF_NOHZ) {
+		user_exit();
+		work &= ~_TIF_NOHZ;
+	}
 
 	/*
 	 * If we stepped into a sysenter/syscall insn, it trapped in
@@ -1492,40 +1488,59 @@ long syscall_trace_enter(struct pt_regs *regs)
 	 * do_debug() and we need to set it again to restore the user
 	 * state.  If we entered on the slow path, TF was already set.
 	 */
-	if (test_thread_flag(TIF_SINGLESTEP))
+	if (work & _TIF_SINGLESTEP)
 		regs->flags |= X86_EFLAGS_TF;
 
-	/* do the secure computing check first */
-	if (secure_computing(regs->orig_ax)) {
-		/* seccomp failures shouldn't expose any additional code. */
-		ret = -1L;
-		goto out;
-	}
+	if (unlikely(work & _TIF_SYSCALL_EMU))
+		emulated = true;
 
-	if (unlikely(test_thread_flag(TIF_SYSCALL_EMU)))
-		ret = -1L;
-
-	if ((ret || test_thread_flag(TIF_SYSCALL_TRACE)) &&
+	if ((emulated || (work & _TIF_SYSCALL_TRACE)) &&
 	    tracehook_report_syscall_entry(regs))
-		ret = -1L;
+		return -1L;
+
+	if (emulated)
+		return -1L;
+
+#ifdef CONFIG_SECCOMP
+	/*
+	 * Do seccomp after ptrace, to catch any tracer changes.
+	 */
+	if (work & _TIF_SECCOMP) {
+		struct seccomp_data sd;
+
+		sd.arch = arch;
+		sd.nr = regs->orig_ax;
+		sd.instruction_pointer = regs->ip;
+#ifdef CONFIG_X86_64
+		if (arch == AUDIT_ARCH_X86_64) {
+			sd.args[0] = regs->di;
+			sd.args[1] = regs->si;
+			sd.args[2] = regs->dx;
+			sd.args[3] = regs->r10;
+			sd.args[4] = regs->r8;
+			sd.args[5] = regs->r9;
+		} else
+#endif
+		{
+			sd.args[0] = regs->bx;
+			sd.args[1] = regs->cx;
+			sd.args[2] = regs->dx;
+			sd.args[3] = regs->si;
+			sd.args[4] = regs->di;
+			sd.args[5] = regs->bp;
+		}
+
+		ret = __secure_computing(&sd);
+		if (ret == -1)
+			return ret;
+	}
+#endif
 
 	if (unlikely(test_thread_flag(TIF_SYSCALL_TRACEPOINT)))
 		trace_sys_enter(regs, regs->orig_ax);
 
-	if (is_ia32_task())
-		audit_syscall_entry(AUDIT_ARCH_I386,
-				    regs->orig_ax,
-				    regs->bx, regs->cx,
-				    regs->dx, regs->si);
-#ifdef CONFIG_X86_64
-	else
-		audit_syscall_entry(AUDIT_ARCH_X86_64,
-				    regs->orig_ax,
-				    regs->di, regs->si,
-				    regs->dx, regs->r10);
-#endif
+	do_audit_syscall_entry(regs, arch);
 
-out:
 	return ret ?: regs->orig_ax;
 }
 

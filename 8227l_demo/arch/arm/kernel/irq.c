@@ -37,12 +37,12 @@
 #include <linux/proc_fs.h>
 #include <linux/export.h>
 
+#include <asm/hardware/cache-l2x0.h>
 #include <asm/exception.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/irq.h>
 #include <asm/mach/time.h>
 
-#include <linux/mt_sched_mon.h>
 unsigned long irq_err_count;
 
 int arch_show_interrupts(struct seq_file *p, int prec)
@@ -57,10 +57,6 @@ int arch_show_interrupts(struct seq_file *p, int prec)
 	return 0;
 }
 
-#ifdef CONFIG_MTK_SCHED_TRACERS
-#include <trace/events/mtk_events.h>
-#endif
-
 /*
  * handle_IRQ handles all hardware IRQ's.  Decoded IRQs should
  * not come via this function.  Instead, they should provide their
@@ -69,36 +65,7 @@ int arch_show_interrupts(struct seq_file *p, int prec)
  */
 void handle_IRQ(unsigned int irq, struct pt_regs *regs)
 {
-	struct pt_regs *old_regs = set_irq_regs(regs);
-#ifdef CONFIG_MTK_SCHED_TRACERS
-    struct irq_desc *desc;
-#endif
-
-	irq_enter();
-    mt_trace_ISR_start(irq);
-#ifdef CONFIG_MTK_SCHED_TRACERS
-    desc = irq_to_desc(irq);
-    trace_irq_entry(irq,
-            (desc && desc->action && desc->action->name) ? desc->action->name : "-");
-#endif
-
-	/*
-	 * Some hardware gives randomly wrong interrupts.  Rather
-	 * than crashing, do something sensible.
-	 */
-	if (unlikely(irq >= nr_irqs)) {
-		if (printk_ratelimit())
-			printk(KERN_WARNING "Bad IRQ%u\n", irq);
-		ack_bad_irq(irq);
-	} else {
-		generic_handle_irq(irq);
-	}
-#ifdef CONFIG_MTK_SCHED_TRACERS
-    trace_irq_exit(irq);
-#endif
-    mt_trace_ISR_end(irq);
-	irq_exit();
-	set_irq_regs(old_regs);
+	__handle_domain_irq(NULL, irq, false, regs);
 }
 
 /*
@@ -132,10 +99,21 @@ EXPORT_SYMBOL_GPL(set_irq_flags);
 
 void __init init_IRQ(void)
 {
+	int ret;
+
 	if (IS_ENABLED(CONFIG_OF) && !machine_desc->init_irq)
 		irqchip_init();
 	else
 		machine_desc->init_irq();
+
+	if (IS_ENABLED(CONFIG_OF) && IS_ENABLED(CONFIG_CACHE_L2X0) &&
+	    (machine_desc->l2c_aux_mask || machine_desc->l2c_aux_val)) {
+		outer_cache.write_sec = machine_desc->l2c_write_sec;
+		ret = l2x0_of_init(machine_desc->l2c_aux_val,
+				   machine_desc->l2c_aux_mask);
+		if (ret)
+			pr_err("L2C: failed to init: %d\n", ret);
+	}
 }
 
 #ifdef CONFIG_MULTI_IRQ_HANDLER
@@ -210,8 +188,8 @@ void migrate_irqs(void)
 		raw_spin_unlock(&desc->lock);
 
 		if (affinity_broken && printk_ratelimit())
-			pr_warning("IRQ%u no longer affine to CPU%u\n", i,
-				smp_processor_id());
+			pr_warn("IRQ%u no longer affine to CPU%u\n",
+				i, smp_processor_id());
 	}
 
 	local_irq_restore(flags);

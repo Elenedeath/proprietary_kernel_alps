@@ -24,32 +24,6 @@
 
 #include "internal.h"
 
-#include <linux/aee.h>
-
-/* -------------------------------------------------------------*/
-/* This is for central management of MTK char device number -- */
-#ifdef CONFIG_MT_CHRDEV_REG
-
-#define MTCHRDEV_REG(num, name) CHDEV_##name,
-
-#define MAKE_MTCHRDEV_ENUM
-#include <mach/mtchrdev_table.h>
-
-#undef MTCHRDEV_REG
-#define MTCHRDEV_REG(num, name) \
-    [CHDEV_##name] = {num, #name},
-
-struct{
-    const int dev_num;
-    const char *name;
-}mtchrdev_info[MTCHRDEV_COUNT] = {
-    [ DNY_CHRDEV ] = { 0, "dynamic" },
-#include <mach/mtchrdev_table.h>
-};
-#endif/* end of CONFIG_MT_CHRDEV_REG*/
-int dynamic_chardev_num = CHRDEV_MAJOR_HASH_SIZE;
-/* -------------------------------------------------------------*/
-
 /*
  * capabilities for /dev/mem, /dev/kmem and similar directly mappable character
  * devices
@@ -98,21 +72,8 @@ void chrdev_show(struct seq_file *f, off_t offset)
 
 	if (offset < CHRDEV_MAJOR_HASH_SIZE) {
 		mutex_lock(&chrdevs_lock);
-		for (cd = chrdevs[offset]; cd; cd = cd->next){
-#ifdef CONFIG_MT_CHRDEV_REG
-            int i;
-            for (i = 0; i< dynamic_chardev_num; i++){
-                if(cd->major == mtchrdev_info[i].dev_num)
-                    break;
-            }
-            if(i == dynamic_chardev_num && cd->major < dynamic_chardev_num)
-                seq_printf(f, "%3d %s (not MT default dev)\n", cd->major, cd->name);
-            else
-                seq_printf(f, "%3d %s\n", cd->major, cd->name);
-#else
+		for (cd = chrdevs[offset]; cd; cd = cd->next)
 			seq_printf(f, "%3d %s\n", cd->major, cd->name);
-#endif
-        }
 		mutex_unlock(&chrdevs_lock);
 	}
 }
@@ -137,21 +98,13 @@ __register_chrdev_region(unsigned int major, unsigned int baseminor,
 	struct char_device_struct *cd, **cp;
 	int ret = 0;
 	int i;
-    char aee_str[64];
+
 	cd = kzalloc(sizeof(struct char_device_struct), GFP_KERNEL);
 	if (cd == NULL)
 		return ERR_PTR(-ENOMEM);
 
 	mutex_lock(&chrdevs_lock);
-#ifdef CONFIG_MT_CHRDEV_REG
-    for (i = 0; i< MTCHRDEV_COUNT; i++){
-        if(major == mtchrdev_info[i].dev_num)
-        break;
-    }
-    if(i == MTCHRDEV_COUNT)
-        printk(KERN_WARNING "[CharDev WARN!!] Not MT char device: %d:%s\n", major, name);
-    
-#endif
+
 	/* temporary */
 	if (major == 0) {
 		for (i = ARRAY_SIZE(chrdevs)-1; i > 0; i--) {
@@ -160,13 +113,10 @@ __register_chrdev_region(unsigned int major, unsigned int baseminor,
 		}
 
 		if (i == 0) {
-            sprintf( aee_str, "[%s]reg cdev fail", name);
-            printk(KERN_ERR"No enough cdev number!!\n");
 			ret = -EBUSY;
 			goto out;
 		}
 		major = i;
-        dynamic_chardev_num = i;
 		ret = major;
 	}
 
@@ -193,21 +143,21 @@ __register_chrdev_region(unsigned int major, unsigned int baseminor,
 
 		/* New driver overlaps from the left.  */
 		if (new_max >= old_min && new_max <= old_max) {
-            sprintf( aee_str, "Driver:%s cdev reg fail", name);
-            printk(KERN_ERR"\n!!\n");
-            printk(KERN_ERR"[%s] register cdev error at MAJOR %d. Already used by [%s]\n!!\n\n",name, major, (*cp)->name);
 			ret = -EBUSY;
 			goto out;
 		}
 
 		/* New driver overlaps from the right.  */
 		if (new_min <= old_max && new_min >= old_min) {
-            sprintf( aee_str, "Driver:%s:cdev reg fail", name);
-            printk(KERN_ERR"\n!!\n");
-            printk(KERN_ERR"[%s] register cdev error at MAJOR %d. Already used by [%s]\n!!\n\n",name, major, (*cp)->name);
 			ret = -EBUSY;
 			goto out;
 		}
+
+		if (new_min < old_min && new_max > old_max) {
+			ret = -EBUSY;
+			goto out;
+		}
+
 	}
 
 	cd->next = *cp;
@@ -217,7 +167,6 @@ __register_chrdev_region(unsigned int major, unsigned int baseminor,
 out:
 	mutex_unlock(&chrdevs_lock);
 	kfree(cd);
-    aee_kernel_warning( aee_str,"cdev reg\n");
 	return ERR_PTR(ret);
 }
 
@@ -405,7 +354,7 @@ static struct kobject *cdev_get(struct cdev *p)
 
 	if (owner && !try_module_get(owner))
 		return NULL;
-	kobj = kobject_get(&p->kobj);
+	kobj = kobject_get_unless_zero(&p->kobj);
 	if (!kobj)
 		module_put(owner);
 	return kobj;
@@ -425,6 +374,7 @@ void cdev_put(struct cdev *p)
  */
 static int chrdev_open(struct inode *inode, struct file *filp)
 {
+	const struct file_operations *fops;
 	struct cdev *p;
 	struct cdev *new = NULL;
 	int ret = 0;
@@ -457,10 +407,11 @@ static int chrdev_open(struct inode *inode, struct file *filp)
 		return ret;
 
 	ret = -ENXIO;
-	filp->f_op = fops_get(p->ops);
-	if (!filp->f_op)
+	fops = fops_get(p->ops);
+	if (!fops)
 		goto out_cdev_put;
 
+	replace_fops(filp, fops);
 	if (filp->f_op->open) {
 		ret = filp->f_op->open(inode, filp);
 		if (ret)
@@ -543,6 +494,85 @@ int cdev_add(struct cdev *p, dev_t dev, unsigned count)
 	return 0;
 }
 
+/**
+ * cdev_set_parent() - set the parent kobject for a char device
+ * @p: the cdev structure
+ * @kobj: the kobject to take a reference to
+ *
+ * cdev_set_parent() sets a parent kobject which will be referenced
+ * appropriately so the parent is not freed before the cdev. This
+ * should be called before cdev_add.
+ */
+void cdev_set_parent(struct cdev *p, struct kobject *kobj)
+{
+	WARN_ON(!kobj->state_initialized);
+	p->kobj.parent = kobj;
+}
+
+/**
+ * cdev_device_add() - add a char device and it's corresponding
+ *	struct device, linkink
+ * @dev: the device structure
+ * @cdev: the cdev structure
+ *
+ * cdev_device_add() adds the char device represented by @cdev to the system,
+ * just as cdev_add does. It then adds @dev to the system using device_add
+ * The dev_t for the char device will be taken from the struct device which
+ * needs to be initialized first. This helper function correctly takes a
+ * reference to the parent device so the parent will not get released until
+ * all references to the cdev are released.
+ *
+ * This helper uses dev->devt for the device number. If it is not set
+ * it will not add the cdev and it will be equivalent to device_add.
+ *
+ * This function should be used whenever the struct cdev and the
+ * struct device are members of the same structure whose lifetime is
+ * managed by the struct device.
+ *
+ * NOTE: Callers must assume that userspace was able to open the cdev and
+ * can call cdev fops callbacks at any time, even if this function fails.
+ */
+int cdev_device_add(struct cdev *cdev, struct device *dev)
+{
+	int rc = 0;
+
+	if (dev->devt) {
+		cdev_set_parent(cdev, &dev->kobj);
+
+		rc = cdev_add(cdev, dev->devt, 1);
+		if (rc)
+			return rc;
+	}
+
+	rc = device_add(dev);
+	if (rc)
+		cdev_del(cdev);
+
+	return rc;
+}
+
+/**
+ * cdev_device_del() - inverse of cdev_device_add
+ * @dev: the device structure
+ * @cdev: the cdev structure
+ *
+ * cdev_device_del() is a helper function to call cdev_del and device_del.
+ * It should be used whenever cdev_device_add is used.
+ *
+ * If dev->devt is not set it will not remove the cdev and will be equivalent
+ * to device_del.
+ *
+ * NOTE: This guarantees that associated sysfs callbacks are not running
+ * or runnable, however any cdevs already open will remain and their fops
+ * will still be callable even after this function returns.
+ */
+void cdev_device_del(struct cdev *cdev, struct device *dev)
+{
+	device_del(dev);
+	if (dev->devt)
+		cdev_del(cdev);
+}
+
 static void cdev_unmap(dev_t dev, unsigned count)
 {
 	kobj_unmap(cdev_map, dev, count);
@@ -554,6 +584,10 @@ static void cdev_unmap(dev_t dev, unsigned count)
  *
  * cdev_del() removes @p from the system, possibly freeing the structure
  * itself.
+ *
+ * NOTE: This guarantees that cdev device will no longer be able to be
+ * opened, however any cdevs already open will remain and their fops will
+ * still be callable even after cdev_del returns.
  */
 void cdev_del(struct cdev *p)
 {
@@ -631,7 +665,8 @@ static struct kobject *base_probe(dev_t dev, int *part, void *data)
 void __init chrdev_init(void)
 {
 	cdev_map = kobj_map_init(base_probe, &chrdevs_lock);
-	bdi_init(&directly_mappable_cdev_bdi);
+	if (bdi_init(&directly_mappable_cdev_bdi))
+		panic("Failed to init directly mappable cdev bdi");
 }
 
 
@@ -643,6 +678,9 @@ EXPORT_SYMBOL(cdev_init);
 EXPORT_SYMBOL(cdev_alloc);
 EXPORT_SYMBOL(cdev_del);
 EXPORT_SYMBOL(cdev_add);
+EXPORT_SYMBOL(cdev_set_parent);
+EXPORT_SYMBOL(cdev_device_add);
+EXPORT_SYMBOL(cdev_device_del);
 EXPORT_SYMBOL(__register_chrdev);
 EXPORT_SYMBOL(__unregister_chrdev);
 EXPORT_SYMBOL(directly_mappable_cdev_bdi);
