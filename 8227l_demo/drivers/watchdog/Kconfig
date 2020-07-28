@@ -505,16 +505,6 @@ config MESON_WATCHDOG
 	  To compile this driver as a module, choose M here: the
 	  module will be called meson_wdt.
 
-config MEDIATEK_WATCHDOG
-	tristate "Mediatek SoCs watchdog support"
-	depends on ARCH_MEDIATEK || COMPILE_TEST
-	select WATCHDOG_CORE
-	help
-	  Say Y here to include support for the watchdog timer
-	  in Mediatek SoCs.
-	  To compile this driver as a module, choose M here: the
-	  module will be called mtk_wdt.
-
 # AVR32 Architecture
 
 config AT32AP700X_WDT
@@ -1257,13 +1247,6 @@ config RALINK_WDT
 	depends on RALINK
 	help
 	  Hardware driver for the Ralink SoC Watchdog Timer.
-
-config MT7621_WDT
-	tristate "Mediatek SoC watchdog"
-	select WATCHDOG_CORE
-	depends on SOC_MT7620 || SOC_MT7621
-	help
-	  Hardware driver for the Mediatek/Ralink MT7621/8 SoC Watchdog Timer.
 
 # PARISC Architecture
 

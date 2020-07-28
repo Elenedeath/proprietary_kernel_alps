@@ -2,8 +2,6 @@
 # Makefile for the Linux Wireless network device drivers.
 #
 
-obj-$(CONFIG_WLAN_VENDOR_MEDIATEK) += mediatek/
-
 obj-$(CONFIG_IPW2100) += ipw2x00/
 obj-$(CONFIG_IPW2200) += ipw2x00/
 

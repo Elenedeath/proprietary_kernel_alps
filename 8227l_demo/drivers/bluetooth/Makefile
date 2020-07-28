@@ -18,8 +18,6 @@ obj-$(CONFIG_BT_HCIBTSDIO)	+= btsdio.o
 obj-$(CONFIG_BT_ATH3K)		+= ath3k.o
 obj-$(CONFIG_BT_MRVL)		+= btmrvl.o
 obj-$(CONFIG_BT_MRVL_SDIO)	+= btmrvl_sdio.o
-obj-$(CONFIG_BT_MTKSDIO)	+= btmtksdio.o
-obj-$(CONFIG_BT_MTKUART)	+= btmtkuart.o
 obj-$(CONFIG_BT_WILINK)		+= btwilink.o
 
 btmrvl-y			:= btmrvl_main.o
